@@ -1,3 +1,3 @@
 # FieldEdge Packet Capture Utility
 
-Work in progress.
+[Documentation](https://inmarsat-enterprise.github.io/fieldedge-pcap/)
