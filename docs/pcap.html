@@ -725,7 +725,7 @@ def process_pcap(filename: str,
 def pcap_filename(duration: int) -&gt; str:
     &#34;&#34;&#34;Generates a pcap filename using datetime of the capture start.
     
-    The datetime is UTC, and DDDDD is the duration in seconds.
+    The datetime is UTC, and the duration is in seconds.
 
     Returns:
         A string formatted as `capture_YYYYmmddTHHMMSS_DDDDD.pcap`.
@@ -820,7 +820,7 @@ def create_pcap(interface: str = &#39;eth1&#39;,
 <h2 class="section-title" id="header-functions">Functions</h2>
 <dl>
 <dt id="fieldedge_pcap.pcap.create_pcap"><code class="name flex">
-<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10ce7ef28>> = None, debug: bool = False, log: logging.Logger = None) ‑> str</span>
+<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10a8bbe80>> = None, debug: bool = False, log: logging.Logger = None) ‑> str</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Creates a packet capture file of a specified interface.</p>
@@ -1023,7 +1023,7 @@ should have a returncode 0.</p>
 </code></dt>
 <dd>
 <div class="desc"><p>Generates a pcap filename using datetime of the capture start.</p>
-<p>The datetime is UTC, and DDDDD is the duration in seconds.</p>
+<p>The datetime is UTC, and the duration is in seconds.</p>
 <h2 id="returns">Returns</h2>
 <p>A string formatted as <code>capture_YYYYmmddTHHMMSS_DDDDD.pcap</code>.</p></div>
 <details class="source">
@@ -1033,7 +1033,7 @@ should have a returncode 0.</p>
 <pre><code class="python">def pcap_filename(duration: int) -&gt; str:
     &#34;&#34;&#34;Generates a pcap filename using datetime of the capture start.
     
-    The datetime is UTC, and DDDDD is the duration in seconds.
+    The datetime is UTC, and the duration is in seconds.
 
     Returns:
         A string formatted as `capture_YYYYmmddTHHMMSS_DDDDD.pcap`.
@@ -1045,7 +1045,7 @@ should have a returncode 0.</p>
 </details>
 </dd>
 <dt id="fieldedge_pcap.pcap.process_pcap"><code class="name flex">
-<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10ce7ef28>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
+<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10a8bbe80>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
 </code></dt>
 <dd>
 <div class="desc"><p>Processes a PCAP file to create metrics for conversations.</p>

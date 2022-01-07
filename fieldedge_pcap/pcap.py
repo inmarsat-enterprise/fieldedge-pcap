@@ -686,7 +686,7 @@ def process_pcap(filename: str,
 def pcap_filename(duration: int) -> str:
     """Generates a pcap filename using datetime of the capture start.
     
-    The datetime is UTC, and DDDDD is the duration in seconds.
+    The datetime is UTC, and the duration is in seconds.
 
     Returns:
         A string formatted as `capture_YYYYmmddTHHMMSS_DDDDD.pcap`.
