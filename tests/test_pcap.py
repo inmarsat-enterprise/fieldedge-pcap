@@ -7,19 +7,27 @@ from time import time
 
 from fieldedge_pcap import pcap
 
+TEST_DIR = './pcaps/samples'
+TEST_INTERFACE = 'en0'
+
 def is_corrupt(filename: str) -> bool:
     try:
         res = subprocess.run(['tshark', '-r', f'{filename}'], check=True,
-            capture_output=True, text=True)
+            capture_output=True, text=True).stderr
     except subprocess.CalledProcessError as err:
         res = err.stderr
     if 'appears to have been cut short' in res:
         return True
     return False
 
+
 def fix_corrupt(filename: str) -> bool:
+    oldname = f'{filename}.orig'
+    os.rename(filename, oldname)
     try:
-        res = subprocess.run(['editcap', f'{filename}', f'{filename}'],
+        # Observation is that running editcap with same source and dest
+        #   filename causes problems truncating the file.
+        res = subprocess.run(['editcap', f'{oldname}', f'{filename}'],
             check=True, capture_output=True, text=True).returncode
     except subprocess.CalledProcessError as err:
         res = err.returncode
@@ -27,22 +35,25 @@ def fix_corrupt(filename: str) -> bool:
         return True
     return False
 
+
+def cleanup(filename: str):
+    shutil.rmtree(os.path.dirname(filename))
+
+
 def test_create():
     """Creates and reads a pcap file on a local interface."""
-    interface = 'en0'
-    target_directory = '../pcaps'
-    filename = pcap.create_pcap(interface=interface, duration=5,
-        target_directory=target_directory, debug=True)
+    filename = pcap.create_pcap(interface=TEST_INTERFACE, duration=5,
+        target_directory=TEST_DIR, debug=True)
     assert(os.path.isfile(filename))
+    cleanup(filename)
+
 
 def test_create_multiprocessing():
-    interface = 'en0'
-    target_directory = '../pcaps'
     queue = Queue()
     kwargs = {
-        'interface': interface,
+        'interface': TEST_INTERFACE,
         'duration': 5,
-        'target_directory': target_directory,
+        'target_directory': TEST_DIR,
         'queue': queue,
         'debug': True,
     }
@@ -53,25 +64,26 @@ def test_create_multiprocessing():
     assert(os.path.isfile(filename))
     if is_corrupt(filename):
         assert fix_corrupt(filename)
+    cleanup(filename)
+
 
 def test_create_and_read_pcap():
     """Creates and reads a pcap file on a local interface."""
-    interface = 'en0'
-    target_directory = '../pcaps'
-    filename = pcap.create_pcap(interface=interface, duration=5,
-        target_directory=target_directory, debug=True)
+    filename = pcap.create_pcap(interface=TEST_INTERFACE, duration=5,
+        target_directory=TEST_DIR, debug=True)
     assert(os.path.isfile(filename))
     if is_corrupt(filename):
         assert fix_corrupt(filename)
     packet_statistics = pcap.process_pcap(filename=filename)
     assert(isinstance(packet_statistics, pcap.PacketStatistics))
-    shutil.rmtree(os.path.dirname(filename))
+    cleanup(filename)
+
 
 def test_packet_statistics():
     """Validates content of the PacketStatistics object."""
-    filename = '../pcaps/samples/mqtts_sample.pcap'
+    filename = f'{TEST_DIR}/mqtts_sample.pcap'
     duration = 50
-    # filename = '../pcaps/samples/capture_20211210T173939_1800.pcap'
+    # filename = f'{TEST_DIR}/capture_20211210T173939_1800.pcap'
     # duration = 1800
     packet_stats = pcap.process_pcap(filename=filename)
     assert isinstance(packet_stats, pcap.PacketStatistics)
@@ -110,9 +122,9 @@ def test_packet_statistics():
 
 def test_process_multiprocessing():
     """Processes a pcap separately using multiprocessing."""
-    # filename = '../pcaps/samples/mqtts_sample.pcap'
-    # filename = '../pcaps/samples/capture_20211205T142537_60.pcap'
-    filename = '../pcaps/samples/capture_20211215T031635_3600.pcap'
+    # filename = f'{TEST_DIR}/mqtts_sample.pcap'
+    # filename = f'{TEST_DIR}/capture_20211205T142537_60.pcap'
+    filename = f'{TEST_DIR}/capture_20211215T031635_3600.pcap'
     q = Queue()
     process = Process(target=pcap.process_pcap, args=(filename, None, q))
     starttime = time()
@@ -133,7 +145,7 @@ def test_process_multiprocessing():
 def test_process():
     """Processes a pcap."""
     # filename = '../pcaps/samples/mqtts_sample.pcap'
-    filename = '../pcaps/samples/capture_20211215T031635_3600.pcap'
+    filename = f'{TEST_DIR}/capture_20211215T031635_3600.pcap'
     if is_corrupt(filename):
         assert fix_corrupt(filename)
     starttime = time()
