@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fieldedge-pcap"
-version = "0.1.1"
+version = "0.1.2"
 description = "Library and models for working with packet capture and analysis."
 authors = ["geoffbrucepayne <geoff.bruce-payne@inmarsat.com>"]
 license = "Apache2.0"
@@ -8,7 +8,7 @@ license = "Apache2.0"
 [tool.poetry.dependencies]
 python = "^3.7"
 pyshark = "^0.4.3"
-fieldedge-utilities = "^0.6.2"
+fieldedge-utilities = "^0.7.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "^6.2.5"
