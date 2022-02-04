@@ -52,8 +52,9 @@ report by exception be used with a less frequent update pushed?
 &#34;&#34;&#34;
 import asyncio
 import json
-import logging
 import os
+import statistics
+from logging import Logger
 from multiprocessing import Queue
 from datetime import datetime
 from enum import Enum
@@ -92,6 +93,41 @@ class EthernetProtocol(Enum):
     ETH_TYPE_TEB = 0x6558  # Transparent Ethernet Bridging
 
 # Common/registered IP protocol ports
+class KnownTcpPorts(Enum):
+    &#34;&#34;&#34;Mappings for application layer ports.&#34;&#34;&#34;
+    SMTP = 25
+    HTTP = 80
+    HTTPS = 443
+    DNS = 53
+    FTP = 20
+    FTPC = 21
+    TELNET = 23
+    IMAP = 143
+    RDP = 3389
+    SSH = 22
+    HTTP2 = 8080
+    MODBUS = 502
+    MODBUS_TLS = 802
+    MQTT = 1883
+    MQTT_TLS = 8883
+    MQTT_SOCKET = 9001
+    DOCKERAPI = 2375
+    DOCKERAPIS = 2376
+    SRCP = 4303
+    COAP = 5683
+    COAPS = 5684
+    DNP2 = 19999
+    DNP = 20000
+    IEC60870 = 2404
+
+class KnownUdpPorts(Enum):
+    SNMP = 161
+    DNS = 53
+    DHCP_QUERY = 67
+    DHCP_RESPONSE = 68
+    NTP = 123
+
+
 class ApplicationPort(Enum):
     &#34;&#34;&#34;Mappings for application layer ports.&#34;&#34;&#34;
     TCP_SMTP = 25
@@ -151,11 +187,19 @@ def _get_ports(packet: SharkPacket) -&gt; tuple:
     Returns:
         A tuple with (source, destination) ports (TCP or UDP)
     &#34;&#34;&#34;
-    transport_layer = packet[packet.transport_layer]
-    return (int(transport_layer.srcport), int(transport_layer.dstport))
+    if packet.transport_layer:
+        srcport = int(packet[packet.transport_layer].srcport)
+        dstport = int(packet[packet.transport_layer].dstport)
+    elif hasattr(packet, &#39;icmp&#39;) and packet[&#39;icmp&#39;].udp_port:
+        srcport = int(packet[&#39;icmp&#39;].udp_srcport)
+        dstport = int(packet[&#39;icmp&#39;].udp_dstport)
+    else:
+        raise ValueError(&#39;Unable to determine transport&#39;
+                            f&#39; for {packet.highest_layer} packet&#39;)
+    return (srcport, dstport)
 
 
-def _get_application(packet: SharkPacket) -&gt; str:
+def _get_application(packet: SharkPacket, log: Logger = None) -&gt; str:
     &#34;&#34;&#34;Returns the application layer descriptor.
     
     If the port is a registered port it will return a caps string.
@@ -166,28 +210,39 @@ def _get_application(packet: SharkPacket) -&gt; str:
     Returns:
         A string with the application layer protocol e.g. `TCP_MQTTS`
     &#34;&#34;&#34;
-    application = &#39;UNKNOWN&#39;
+    if not log:
+        log = get_wrapping_logger()
+    application = None
     if hasattr(packet[packet.highest_layer], &#39;app_data_proto&#39;):
         application = str(packet[packet.highest_layer].app_data_proto).upper()
-    else:
+    elif packet.transport_layer:
         (srcport, dstport) = _get_ports(packet)
-        known_ports = tuple(item.value for item in ApplicationPort)
-        application = str(packet.highest_layer).upper()
-        if srcport in known_ports:
-            application = ApplicationPort(srcport).name
-        elif dstport in known_ports:
-            application = ApplicationPort(dstport).name
-        elif (application == packet.transport_layer):
-            application = f&#39;UNKNOWN_{srcport}_{dstport}&#39;
-            if dstport &lt; srcport:
-                application = f&#39;UNKNOWN_{dstport}_{srcport}&#39;
-    if f&#39;{packet.transport_layer}&#39; not in application:
-        application = f&#39;{packet.transport_layer}_{application}&#39;
+        if packet.transport_layer == &#39;TCP&#39;:
+            known_ports = tuple(item.value for item in KnownTcpPorts)
+            if srcport in known_ports:
+                application = f&#39;TCP_{KnownTcpPorts(srcport).name}&#39;
+            elif dstport in known_ports:
+                application = f&#39;TCP_{KnownTcpPorts(dstport).name}&#39;
+        elif packet.transport_layer == &#39;UDP&#39;:
+            known_ports = tuple(item.value for item in KnownUdpPorts)
+            if srcport in known_ports:
+                application = f&#39;UDP_{KnownUdpPorts(srcport).name}&#39;
+            elif dstport in known_ports:
+                application = f&#39;UDP_{KnownUdpPorts(dstport).name}&#39;
+        if not application and packet.transport_layer != packet.highest_layer:
+            application = (f&#39;{str(packet.transport_layer).upper()}_&#39;
+                           f&#39;{str(packet.highest_layer).upper()}&#39;)
+    else:
+        try:
+            transport_layer = str(packet.layers[2].layer_name).upper()
+            highest_layer = str(packet.highest_layer).upper()
+            application = f&#39;{transport_layer}_{highest_layer}&#39;
+        except Exception as err:
+            log.error(err)
+            application = f&#39;{str(packet.highest_layer).upper()}&#39;
     # identified workarounds for observed pyshark/tshark app_data_proto
     if &#39;HTTP-OVER-TLS&#39; in application:
         application = application.replace(&#39;HTTP-OVER-TLS&#39;, &#39;HTTPS&#39;)
-    if packet.highest_layer == &#39;TLS&#39; and not application.endswith(&#39;S&#39;):
-        application = f&#39;{application}S&#39;
     return application
 
 
@@ -244,6 +299,12 @@ def _is_local_traffic(packet: SharkPacket) -&gt; bool:
         return True
     return False
 
+def _is_invalid_traffic(packet: SharkPacket) -&gt; bool:
+    src, dst = _get_src_dst(packet)
+    if (src == &#39;0.0.0.0&#39; or dst == &#39;0.0.0.0&#39;):
+        return True
+    return False
+
 
 class SimplePacket:
     &#34;&#34;&#34;A simplified packet representation.
@@ -266,9 +327,17 @@ class SimplePacket:
         self.timestamp = round(float(packet.sniff_timestamp), 3)
         self.size = int(packet.length)
         self.transport = packet.transport_layer
+        if packet.transport_layer:
+            self.transport = packet.transport_layer
+            self.stream_id = str(packet[self.transport].stream)
+        elif hasattr(packet, &#39;icmp&#39;) and packet[&#39;icmp&#39;].udp_port:
+            self.transport = &#39;UDP&#39;
+            self.stream_id = str(packet[&#39;icmp&#39;].udp_stream)
+        else:
+            raise ValueError(&#39;Unable to determine transport&#39;
+                                f&#39; for {packet.highest_layer} packet&#39;)
         self.src, self.dst = _get_src_dst(packet)
-        self.srcport = int(packet[self.transport].srcport)
-        self.dstport = int(packet[self.transport].dstport)
+        self.srcport, self.dstport = _get_ports(packet)
         self.highest_layer = str(packet.highest_layer).upper()
         self.application = _get_application(packet)
         self.a_b = True if self.src == self._parent_hosts[0] else False
@@ -290,7 +359,7 @@ class Conversation:
         bytes_total: The total number of bytes in the conversation
 
     &#34;&#34;&#34;
-    def __init__(self, packet: SharkPacket = None, log: logging.Logger = None):
+    def __init__(self, packet: SharkPacket = None, log: Logger = None):
         self._log = log or get_wrapping_logger()
         self.application: str = None
         self.hosts: tuple = None
@@ -302,6 +371,7 @@ class Conversation:
         self.packets: list[SimplePacket] = []
         self.packet_count: int = 0
         self.bytes_total: int = 0
+        self.start_ts: float = None
         if packet is not None:
             self.packet_add(packet)
     
@@ -320,12 +390,19 @@ class Conversation:
         if self.hosts is None:
             return False
         (src, dst) = _get_src_dst(packet)
-        try:
+        if _is_local_traffic(packet):
+            return False
+        stream_id = None
+        if packet.transport_layer:
             transport = packet.transport_layer
-            stream_id = packet[transport].stream
-        except AttributeError as err:
-            self._log.exception(f&#39;{err}&#39;)
+            try:
+                stream_id = packet[transport].stream
+            except AttributeError as err:
+                self._log.exception(f&#39;{err}&#39;)
+        elif hasattr(packet, &#39;icmp&#39;) and packet[&#39;icmp&#39;].udp_stream:
+            stream_id = packet[&#39;icmp&#39;].udp_stream
         if (src in self.hosts and dst in self.hosts and
+            stream_id is not None and
             stream_id == self.stream_id):
             return True
         return False
@@ -350,41 +427,38 @@ class Conversation:
             self.hosts = _get_src_dst(packet)
         elif not(self.is_packet_in_flow(packet)):
             return False
-        (src, dst) = _get_src_dst(packet)
-        del dst   #:Unused
-        if src == self.hosts[0]:
+        try:
+            simple_packet = SimplePacket(packet, self.hosts)
+        except Exception as err:
+            self._log.error(err)
+            raise err
+        isotime = datetime.utcfromtimestamp(simple_packet.timestamp).isoformat()[0:23]
+        self._log.debug(f&#39;{isotime}|{simple_packet.application}|&#39;
+            f&#39;({simple_packet.transport}.{simple_packet.stream_id}:{simple_packet.dstport})&#39;
+            f&#39;|{simple_packet.size} bytes|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
+        if simple_packet.src == self.hosts[0]:
             self.a_b += 1
         else:
             self.b_a += 1
         if self.transport is None:
-            if packet.transport_layer is None:
-                err = f&#39;Packet missing transport_layer&#39;
-                self._log.error(err)
-                raise ValueError(err)
-            self.transport = packet.transport_layer
-        elif packet.transport_layer != self.transport:
-            err = (f&#39;Expected transport {self.transport}&#39;
-                f&#39; got {packet.transport_layer}&#39;)
-            self._log.error(err)
-            raise ValueError(err)
-        srcport = int(packet[self.transport].srcport)
-        if srcport not in self.ports:
-            self.ports.append(srcport)
-        dstport = int(packet[self.transport].dstport)
-        if dstport not in self.ports:
-            self.ports.append(dstport)
-        stream_id = packet[self.transport].stream
+            self.transport = simple_packet.transport
+        if simple_packet.srcport not in self.ports:
+            self.ports.append(simple_packet.srcport)
+        if simple_packet.dstport not in self.ports:
+            self.ports.append(simple_packet.dstport)
         if self.stream_id is None:
-            self.stream_id = stream_id
-        elif stream_id != self.stream_id:
+            self.stream_id = simple_packet.stream_id
+        elif simple_packet.stream_id != self.stream_id:
             err = (f&#39;Expected stream {self.stream_id}&#39;
-                f&#39; got {packet[self.transport].stream}&#39;)
-            self._log.error(err)
+                   f&#39; but got {simple_packet.stream_id}&#39;)
+            # self._log.error(err)
             raise ValueError(err)
         self.packet_count += 1
-        self.bytes_total += int(packet.length)
+        self.bytes_total += simple_packet.size
+        if self.start_ts is None:
+            self.start_ts = simple_packet.timestamp
+        # TODO: can likely remove the try/except below
         try:
-            simple_packet = SimplePacket(packet, self.hosts)
             self.packets.append(simple_packet)
             if self.application is None:
                 self.application = simple_packet.application
@@ -488,8 +562,7 @@ class Conversation:
         packets_a_b, packets_b_a = self.group_packets_by_size()
         # TODO: dominant packet list based on quantity * size
         return {
-            &#39;A&#39;: self.hosts[0],
-            &#39;B&#39;: self.hosts[1],
+            &#39;hosts&#39;: self.hosts,
             &#39;AB_intervals&#39;: self._get_intervals_by_length(packets_a_b),
             &#39;BA_intervals&#39;: self._get_intervals_by_length(packets_b_a)
         }
@@ -505,7 +578,7 @@ class PacketStatistics:
 
     &#34;&#34;&#34;
     def __init__(self,
-                 log: logging.Logger = None,
+                 log: Logger = None,
                  source_filename: str = None,
                  ) -&gt; None:
         &#34;&#34;&#34;Creates a PacketStatistics object.
@@ -519,7 +592,12 @@ class PacketStatistics:
         self._source_filename: str = source_filename
         self.conversations: list[Conversation] = []
         self._packet_count: int = 0
+        self._unhandled_packet_types: list = []
+        self._unhandled_packet_count: int = 0
+        self._local_packet_count: int = 0
         self._bytes_total: int = 0
+        self._unhandled_bytes: int = 0
+        self._local_bytes: int = 0
         self._first_packet_ts: float = None
         self._last_packet_ts: float = None
     
@@ -551,9 +629,7 @@ class PacketStatistics:
 
         &#34;&#34;&#34;
         self._packet_count += 1
-        packet_type = packet.highest_layer
-        packet_length = int(packet.length)
-        self._bytes_total += packet_length
+        self._bytes_total += int(packet.length)
         ts = round(float(packet.sniff_timestamp), 3)
         if self._first_packet_ts is None:
             self._first_packet_ts = ts
@@ -562,9 +638,10 @@ class PacketStatistics:
             self._process_arp(packet)
         elif hasattr(packet, &#39;tcp&#39;) or hasattr(packet, &#39;udp&#39;):
             self._process_ip(packet)
+        elif hasattr(packet, &#39;icmp&#39;):
+            self._process_ip(packet)
         else:
-            self._log.warning(f&#39;Unhandled packet type {packet_type}&#39;)
-            return
+            self._process_unhandled(packet)
     
     def _process_arp(self, packet: SharkPacket):
         arp_desc = f&#39;{packet.arp.src_proto_ipv4}--&gt;{packet.arp.dst_proto_ipv4}&#39;
@@ -575,26 +652,27 @@ class PacketStatistics:
 
     def _process_ip(self, packet: SharkPacket):
         in_conversation = False
+        if _is_local_traffic(packet):
+            self._local_packet_count += 1
+            self._local_bytes += int(packet.length)
+            return
         for conversation in self.conversations:
             if conversation.is_packet_in_flow(packet):
                 conversation.packet_add(packet)
                 in_conversation = True
+                break
         if not in_conversation:
             self._log.debug(&#39;Found new conversation&#39;)
             conversation = Conversation(packet, self._log)
             self.conversations.append(conversation)
+
+    def _process_unhandled(self, packet: SharkPacket):
         packet_type = packet.highest_layer
-        packet_length = int(packet.length)
-        ts = round(float(packet.sniff_timestamp), 3)
-        transport = packet.transport_layer
-        if transport is not None:
-            # srcport = packet[transport].srcport   # unused
-            dstport = packet[transport].dstport
-            stream_id = packet[transport].stream
-        isotime = datetime.utcfromtimestamp(ts).isoformat()[0:23]
-        self._log.debug(f&#39;{isotime}|{packet_type}|&#39;
-            f&#39;({transport}.{stream_id}:{dstport})&#39;
-            f&#39;|{packet_length} bytes|{packet.ip.src}--&gt;{packet.ip.dst}&#39;)
+        self._unhandled_packet_count += 1
+        self._unhandled_bytes += int(packet.length)
+        if packet_type not in self._unhandled_packet_types:
+            self._log.warning(f&#39;Unhandled packet type {packet_type}&#39;)
+            self._unhandled_packet_types.append(packet_type)
 
     def data_series_application_size(self) -&gt; dict:
         &#34;&#34;&#34;Returns a set of data series by conversation application.
@@ -617,19 +695,71 @@ class PacketStatistics:
             multi_series[app].sort(key=lambda tup: tup[0])
         return multi_series
 
-    def analyze_conversations(self) -&gt; list:
-        &#34;&#34;&#34;Analyzes the conversations.
+    def analyze_conversations(self) -&gt; dict:
+        &#34;&#34;&#34;Analyzes all conversations to produce a summary.
         
         Returns:
-            A list of analyses currently consisting of the intervals between
-                similarly sized packets of a given application.
+            A dict with keys as unique host pairs &#34;(&#39;A&#39;, &#39;B&#39;)&#34; summary dict:
+                {
+                    count: `int`,
+                    applications: `list[str]`,
+                    start_times: `list[float]`,
+                    packet_intervals: {
+                        AB_intervals: {
+                            &#39;&lt;transport&gt;_&lt;protocol&gt;_&lt;bytesize&gt;&#39;: `int`|`None`,
+                        },
+                        BA_intervals: {
+                            &#39;&lt;transport&gt;_&lt;protocol&gt;_&lt;bytesize&gt;&#39;: `int`|`None`,
+                        }
+                    },
+                    repeat_mean: `int`,
+                    repeat_stdev: `int`
+                }
 
         &#34;&#34;&#34;
+        results = {}
+        for conversation in self.conversations:
+            hosts_str = str(conversation.hosts)
+            intervals = conversation.intervals()
+            intervals.pop(&#39;hosts&#39;, None)
+            i_tag = &#39;packet_intervals&#39;
+            if hosts_str not in results:
+                results[hosts_str] = {
+                    &#39;count&#39;: 1,
+                    &#39;applications&#39;: [conversation.application],
+                    &#39;start_times&#39;: [conversation.start_ts],
+                    i_tag: intervals,
+                }
+            else:
+                results[hosts_str][&#39;count&#39;] += 1
+                app = conversation.application
+                if app not in results[hosts_str][&#39;applications&#39;]:
+                    results[hosts_str][&#39;applications&#39;].append(app)
+                results[hosts_str][&#39;start_times&#39;].append(conversation.start_ts)
+                prior = results[hosts_str][i_tag]
+                results[hosts_str][i_tag] = {**prior, **intervals}
+        for key in results:
+            times = results[key][&#39;start_times&#39;]
+            results[key][&#39;repeat_mean&#39;] = None
+            results[key][&#39;repeat_stdev&#39;] = None
+            if len(times) == 1:
+                continue
+            intervals = []
+            for i, ts in enumerate(times):
+                if i == 0:
+                    continue
+                intervals.append(ts - times[i - 1])
+            if len(intervals) &gt; 1:
+                results[key][&#39;repeat_mean&#39;] = int(statistics.mean(intervals))
+                results[key][&#39;repeat_stdev&#39;] = int(statistics.stdev(intervals))
+        return results
+    
+    def unique_host_pairs(self) -&gt; &#39;list[tuple]&#39;:
+        &#34;&#34;&#34;Lists unique host pairs as tuples.&#34;&#34;&#34;
         results = []
         for conversation in self.conversations:
-            analysis = conversation.intervals()
-            # self._log.info(analysis)
-            results.append(analysis)
+            if conversation.hosts not in results:
+                results.append(conversation.hosts)
         return results
 
 
@@ -701,17 +831,19 @@ def process_pcap(filename: str,
     packet_number = 0
     for packet in capture:
         packet_number += 1
+        if packet_number == 0:
+            log.info(&#39;Problem packet...&#39;)
         try:
             packet_stats.packet_add(packet)
         except NotImplementedError as err:
             log.error(f&#39;pyshark: {err}&#39;)
         except TSharkCrashException as err:
-            log.error(f&#39;{err}&#39;)
+            log.error(f&#39;tshark: {err}&#39;)
             break
-        except Exception as err:
+        except Exception:
             #TODO: better error capture e.g. appears to have been cut short use editcap
             # https://tshark.dev/share/pcap_preparation/
-            log.exception(f&#39;Packet {packet_number} processing ERROR:\n{err}&#39;)
+            log.exception(f&#39;Packet {packet_number} processing ERROR&#39;)
             break
     capture.close()
     if newloop:
@@ -742,7 +874,7 @@ def create_pcap(interface: str = &#39;eth1&#39;,
                 target_directory: str = &#39;$HOME&#39;,
                 queue: Queue = None,
                 debug: bool = False,
-                log: logging.Logger = None,
+                log: Logger = None,
                 ) -&gt; str:
     &#34;&#34;&#34;Creates a packet capture file of a specified interface.
 
@@ -757,8 +889,8 @@ def create_pcap(interface: str = &#39;eth1&#39;,
     kwargs = {
         &#39;interface&#39;: my_interface,
         &#39;duration&#39;: my_duration,
-        &#39;filename&#39;: pcap_filename(),
-        &#39;target_directory&#39;: my_folder,
+        &#39;filename&#39;: pcap_filename(duration),
+        &#39;target_directory&#39;: parent_folder,
         &#39;queue&#39;: queue,
     }
     capture_process = multiprocessing.Process(target=create_pcap,
@@ -820,7 +952,7 @@ def create_pcap(interface: str = &#39;eth1&#39;,
 <h2 class="section-title" id="header-functions">Functions</h2>
 <dl>
 <dt id="fieldedge_pcap.pcap.create_pcap"><code class="name flex">
-<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10a8bbe80>> = None, debug: bool = False, log: logging.Logger = None) ‑> str</span>
+<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10af89cf8>> = None, debug: bool = False, log: logging.Logger = None) ‑> str</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Creates a packet capture file of a specified interface.</p>
@@ -834,8 +966,8 @@ To run in the background use a multiprocessing.Process and Queue:</p>
 kwargs = {
     'interface': my_interface,
     'duration': my_duration,
-    'filename': pcap_filename(),
-    'target_directory': my_folder,
+    'filename': pcap_filename(duration),
+    'target_directory': parent_folder,
     'queue': queue,
 }
 capture_process = multiprocessing.Process(target=create_pcap,
@@ -875,7 +1007,7 @@ should have a returncode 0.</p>
                 target_directory: str = &#39;$HOME&#39;,
                 queue: Queue = None,
                 debug: bool = False,
-                log: logging.Logger = None,
+                log: Logger = None,
                 ) -&gt; str:
     &#34;&#34;&#34;Creates a packet capture file of a specified interface.
 
@@ -890,8 +1022,8 @@ should have a returncode 0.</p>
     kwargs = {
         &#39;interface&#39;: my_interface,
         &#39;duration&#39;: my_duration,
-        &#39;filename&#39;: pcap_filename(),
-        &#39;target_directory&#39;: my_folder,
+        &#39;filename&#39;: pcap_filename(duration),
+        &#39;target_directory&#39;: parent_folder,
         &#39;queue&#39;: queue,
     }
     capture_process = multiprocessing.Process(target=create_pcap,
@@ -1045,7 +1177,7 @@ should have a returncode 0.</p>
 </details>
 </dd>
 <dt id="fieldedge_pcap.pcap.process_pcap"><code class="name flex">
-<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10a8bbe80>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
+<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10af89cf8>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
 </code></dt>
 <dd>
 <div class="desc"><p>Processes a PCAP file to create metrics for conversations.</p>
@@ -1142,17 +1274,19 @@ process.join()
     packet_number = 0
     for packet in capture:
         packet_number += 1
+        if packet_number == 0:
+            log.info(&#39;Problem packet...&#39;)
         try:
             packet_stats.packet_add(packet)
         except NotImplementedError as err:
             log.error(f&#39;pyshark: {err}&#39;)
         except TSharkCrashException as err:
-            log.error(f&#39;{err}&#39;)
+            log.error(f&#39;tshark: {err}&#39;)
             break
-        except Exception as err:
+        except Exception:
             #TODO: better error capture e.g. appears to have been cut short use editcap
             # https://tshark.dev/share/pcap_preparation/
-            log.exception(f&#39;Packet {packet_number} processing ERROR:\n{err}&#39;)
+            log.exception(f&#39;Packet {packet_number} processing ERROR&#39;)
             break
     capture.close()
     if newloop:
@@ -1378,7 +1512,7 @@ process.join()
         bytes_total: The total number of bytes in the conversation
 
     &#34;&#34;&#34;
-    def __init__(self, packet: SharkPacket = None, log: logging.Logger = None):
+    def __init__(self, packet: SharkPacket = None, log: Logger = None):
         self._log = log or get_wrapping_logger()
         self.application: str = None
         self.hosts: tuple = None
@@ -1390,6 +1524,7 @@ process.join()
         self.packets: list[SimplePacket] = []
         self.packet_count: int = 0
         self.bytes_total: int = 0
+        self.start_ts: float = None
         if packet is not None:
             self.packet_add(packet)
     
@@ -1408,12 +1543,19 @@ process.join()
         if self.hosts is None:
             return False
         (src, dst) = _get_src_dst(packet)
-        try:
+        if _is_local_traffic(packet):
+            return False
+        stream_id = None
+        if packet.transport_layer:
             transport = packet.transport_layer
-            stream_id = packet[transport].stream
-        except AttributeError as err:
-            self._log.exception(f&#39;{err}&#39;)
+            try:
+                stream_id = packet[transport].stream
+            except AttributeError as err:
+                self._log.exception(f&#39;{err}&#39;)
+        elif hasattr(packet, &#39;icmp&#39;) and packet[&#39;icmp&#39;].udp_stream:
+            stream_id = packet[&#39;icmp&#39;].udp_stream
         if (src in self.hosts and dst in self.hosts and
+            stream_id is not None and
             stream_id == self.stream_id):
             return True
         return False
@@ -1438,41 +1580,38 @@ process.join()
             self.hosts = _get_src_dst(packet)
         elif not(self.is_packet_in_flow(packet)):
             return False
-        (src, dst) = _get_src_dst(packet)
-        del dst   #:Unused
-        if src == self.hosts[0]:
+        try:
+            simple_packet = SimplePacket(packet, self.hosts)
+        except Exception as err:
+            self._log.error(err)
+            raise err
+        isotime = datetime.utcfromtimestamp(simple_packet.timestamp).isoformat()[0:23]
+        self._log.debug(f&#39;{isotime}|{simple_packet.application}|&#39;
+            f&#39;({simple_packet.transport}.{simple_packet.stream_id}:{simple_packet.dstport})&#39;
+            f&#39;|{simple_packet.size} bytes|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
+        if simple_packet.src == self.hosts[0]:
             self.a_b += 1
         else:
             self.b_a += 1
         if self.transport is None:
-            if packet.transport_layer is None:
-                err = f&#39;Packet missing transport_layer&#39;
-                self._log.error(err)
-                raise ValueError(err)
-            self.transport = packet.transport_layer
-        elif packet.transport_layer != self.transport:
-            err = (f&#39;Expected transport {self.transport}&#39;
-                f&#39; got {packet.transport_layer}&#39;)
-            self._log.error(err)
-            raise ValueError(err)
-        srcport = int(packet[self.transport].srcport)
-        if srcport not in self.ports:
-            self.ports.append(srcport)
-        dstport = int(packet[self.transport].dstport)
-        if dstport not in self.ports:
-            self.ports.append(dstport)
-        stream_id = packet[self.transport].stream
+            self.transport = simple_packet.transport
+        if simple_packet.srcport not in self.ports:
+            self.ports.append(simple_packet.srcport)
+        if simple_packet.dstport not in self.ports:
+            self.ports.append(simple_packet.dstport)
         if self.stream_id is None:
-            self.stream_id = stream_id
-        elif stream_id != self.stream_id:
+            self.stream_id = simple_packet.stream_id
+        elif simple_packet.stream_id != self.stream_id:
             err = (f&#39;Expected stream {self.stream_id}&#39;
-                f&#39; got {packet[self.transport].stream}&#39;)
-            self._log.error(err)
+                   f&#39; but got {simple_packet.stream_id}&#39;)
+            # self._log.error(err)
             raise ValueError(err)
         self.packet_count += 1
-        self.bytes_total += int(packet.length)
+        self.bytes_total += simple_packet.size
+        if self.start_ts is None:
+            self.start_ts = simple_packet.timestamp
+        # TODO: can likely remove the try/except below
         try:
-            simple_packet = SimplePacket(packet, self.hosts)
             self.packets.append(simple_packet)
             if self.application is None:
                 self.application = simple_packet.application
@@ -1576,8 +1715,7 @@ process.join()
         packets_a_b, packets_b_a = self.group_packets_by_size()
         # TODO: dominant packet list based on quantity * size
         return {
-            &#39;A&#39;: self.hosts[0],
-            &#39;B&#39;: self.hosts[1],
+            &#39;hosts&#39;: self.hosts,
             &#39;AB_intervals&#39;: self._get_intervals_by_length(packets_a_b),
             &#39;BA_intervals&#39;: self._get_intervals_by_length(packets_b_a)
         }</code></pre>
@@ -1684,8 +1822,7 @@ average repeat interval B to A in seconds</p></div>
     packets_a_b, packets_b_a = self.group_packets_by_size()
     # TODO: dominant packet list based on quantity * size
     return {
-        &#39;A&#39;: self.hosts[0],
-        &#39;B&#39;: self.hosts[1],
+        &#39;hosts&#39;: self.hosts,
         &#39;AB_intervals&#39;: self._get_intervals_by_length(packets_a_b),
         &#39;BA_intervals&#39;: self._get_intervals_by_length(packets_b_a)
     }</code></pre>
@@ -1719,12 +1856,19 @@ average repeat interval B to A in seconds</p></div>
     if self.hosts is None:
         return False
     (src, dst) = _get_src_dst(packet)
-    try:
+    if _is_local_traffic(packet):
+        return False
+    stream_id = None
+    if packet.transport_layer:
         transport = packet.transport_layer
-        stream_id = packet[transport].stream
-    except AttributeError as err:
-        self._log.exception(f&#39;{err}&#39;)
+        try:
+            stream_id = packet[transport].stream
+        except AttributeError as err:
+            self._log.exception(f&#39;{err}&#39;)
+    elif hasattr(packet, &#39;icmp&#39;) and packet[&#39;icmp&#39;].udp_stream:
+        stream_id = packet[&#39;icmp&#39;].udp_stream
     if (src in self.hosts and dst in self.hosts and
+        stream_id is not None and
         stream_id == self.stream_id):
         return True
     return False</code></pre>
@@ -1769,41 +1913,38 @@ different transport or stream ID than the conversation.</p></div>
         self.hosts = _get_src_dst(packet)
     elif not(self.is_packet_in_flow(packet)):
         return False
-    (src, dst) = _get_src_dst(packet)
-    del dst   #:Unused
-    if src == self.hosts[0]:
+    try:
+        simple_packet = SimplePacket(packet, self.hosts)
+    except Exception as err:
+        self._log.error(err)
+        raise err
+    isotime = datetime.utcfromtimestamp(simple_packet.timestamp).isoformat()[0:23]
+    self._log.debug(f&#39;{isotime}|{simple_packet.application}|&#39;
+        f&#39;({simple_packet.transport}.{simple_packet.stream_id}:{simple_packet.dstport})&#39;
+        f&#39;|{simple_packet.size} bytes|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
+    if simple_packet.src == self.hosts[0]:
         self.a_b += 1
     else:
         self.b_a += 1
     if self.transport is None:
-        if packet.transport_layer is None:
-            err = f&#39;Packet missing transport_layer&#39;
-            self._log.error(err)
-            raise ValueError(err)
-        self.transport = packet.transport_layer
-    elif packet.transport_layer != self.transport:
-        err = (f&#39;Expected transport {self.transport}&#39;
-            f&#39; got {packet.transport_layer}&#39;)
-        self._log.error(err)
-        raise ValueError(err)
-    srcport = int(packet[self.transport].srcport)
-    if srcport not in self.ports:
-        self.ports.append(srcport)
-    dstport = int(packet[self.transport].dstport)
-    if dstport not in self.ports:
-        self.ports.append(dstport)
-    stream_id = packet[self.transport].stream
+        self.transport = simple_packet.transport
+    if simple_packet.srcport not in self.ports:
+        self.ports.append(simple_packet.srcport)
+    if simple_packet.dstport not in self.ports:
+        self.ports.append(simple_packet.dstport)
     if self.stream_id is None:
-        self.stream_id = stream_id
-    elif stream_id != self.stream_id:
+        self.stream_id = simple_packet.stream_id
+    elif simple_packet.stream_id != self.stream_id:
         err = (f&#39;Expected stream {self.stream_id}&#39;
-            f&#39; got {packet[self.transport].stream}&#39;)
-        self._log.error(err)
+               f&#39; but got {simple_packet.stream_id}&#39;)
+        # self._log.error(err)
         raise ValueError(err)
     self.packet_count += 1
-    self.bytes_total += int(packet.length)
+    self.bytes_total += simple_packet.size
+    if self.start_ts is None:
+        self.start_ts = simple_packet.timestamp
+    # TODO: can likely remove the try/except below
     try:
-        simple_packet = SimplePacket(packet, self.hosts)
         self.packets.append(simple_packet)
         if self.application is None:
             self.application = simple_packet.application
@@ -1944,6 +2085,192 @@ different transport or stream ID than the conversation.</p></div>
 </dd>
 </dl>
 </dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts"><code class="flex name class">
+<span>class <span class="ident">KnownTcpPorts</span></span>
+<span>(</span><span>value, names=None, *, module=None, qualname=None, type=None, start=1)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Mappings for application layer ports.</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">class KnownTcpPorts(Enum):
+    &#34;&#34;&#34;Mappings for application layer ports.&#34;&#34;&#34;
+    SMTP = 25
+    HTTP = 80
+    HTTPS = 443
+    DNS = 53
+    FTP = 20
+    FTPC = 21
+    TELNET = 23
+    IMAP = 143
+    RDP = 3389
+    SSH = 22
+    HTTP2 = 8080
+    MODBUS = 502
+    MODBUS_TLS = 802
+    MQTT = 1883
+    MQTT_TLS = 8883
+    MQTT_SOCKET = 9001
+    DOCKERAPI = 2375
+    DOCKERAPIS = 2376
+    SRCP = 4303
+    COAP = 5683
+    COAPS = 5684
+    DNP2 = 19999
+    DNP = 20000
+    IEC60870 = 2404</code></pre>
+</details>
+<h3>Ancestors</h3>
+<ul class="hlist">
+<li>enum.Enum</li>
+</ul>
+<h3>Class variables</h3>
+<dl>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.COAP"><code class="name">var <span class="ident">COAP</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.COAPS"><code class="name">var <span class="ident">COAPS</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.DNP"><code class="name">var <span class="ident">DNP</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.DNP2"><code class="name">var <span class="ident">DNP2</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.DNS"><code class="name">var <span class="ident">DNS</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI"><code class="name">var <span class="ident">DOCKERAPI</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPIS"><code class="name">var <span class="ident">DOCKERAPIS</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.FTP"><code class="name">var <span class="ident">FTP</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.FTPC"><code class="name">var <span class="ident">FTPC</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.HTTP"><code class="name">var <span class="ident">HTTP</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.HTTP2"><code class="name">var <span class="ident">HTTP2</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.HTTPS"><code class="name">var <span class="ident">HTTPS</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.IEC60870"><code class="name">var <span class="ident">IEC60870</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.IMAP"><code class="name">var <span class="ident">IMAP</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.MODBUS"><code class="name">var <span class="ident">MODBUS</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.MODBUS_TLS"><code class="name">var <span class="ident">MODBUS_TLS</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.MQTT"><code class="name">var <span class="ident">MQTT</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.MQTT_SOCKET"><code class="name">var <span class="ident">MQTT_SOCKET</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.MQTT_TLS"><code class="name">var <span class="ident">MQTT_TLS</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.RDP"><code class="name">var <span class="ident">RDP</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.SMTP"><code class="name">var <span class="ident">SMTP</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.SRCP"><code class="name">var <span class="ident">SRCP</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.SSH"><code class="name">var <span class="ident">SSH</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.TELNET"><code class="name">var <span class="ident">TELNET</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+</dl>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownUdpPorts"><code class="flex name class">
+<span>class <span class="ident">KnownUdpPorts</span></span>
+<span>(</span><span>value, names=None, *, module=None, qualname=None, type=None, start=1)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>An enumeration.</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">class KnownUdpPorts(Enum):
+    SNMP = 161
+    DNS = 53
+    DHCP_QUERY = 67
+    DHCP_RESPONSE = 68
+    NTP = 123</code></pre>
+</details>
+<h3>Ancestors</h3>
+<ul class="hlist">
+<li>enum.Enum</li>
+</ul>
+<h3>Class variables</h3>
+<dl>
+<dt id="fieldedge_pcap.pcap.KnownUdpPorts.DHCP_QUERY"><code class="name">var <span class="ident">DHCP_QUERY</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownUdpPorts.DHCP_RESPONSE"><code class="name">var <span class="ident">DHCP_RESPONSE</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownUdpPorts.DNS"><code class="name">var <span class="ident">DNS</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownUdpPorts.NTP"><code class="name">var <span class="ident">NTP</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt id="fieldedge_pcap.pcap.KnownUdpPorts.SNMP"><code class="name">var <span class="ident">SNMP</span></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+</dl>
+</dd>
 <dt id="fieldedge_pcap.pcap.PacketStatistics"><code class="flex name class">
 <span>class <span class="ident">PacketStatistics</span></span>
 <span>(</span><span>log: logging.Logger = None, source_filename: str = None)</span>
@@ -1981,7 +2308,7 @@ different transport or stream ID than the conversation.</p></div>
 
     &#34;&#34;&#34;
     def __init__(self,
-                 log: logging.Logger = None,
+                 log: Logger = None,
                  source_filename: str = None,
                  ) -&gt; None:
         &#34;&#34;&#34;Creates a PacketStatistics object.
@@ -1995,7 +2322,12 @@ different transport or stream ID than the conversation.</p></div>
         self._source_filename: str = source_filename
         self.conversations: list[Conversation] = []
         self._packet_count: int = 0
+        self._unhandled_packet_types: list = []
+        self._unhandled_packet_count: int = 0
+        self._local_packet_count: int = 0
         self._bytes_total: int = 0
+        self._unhandled_bytes: int = 0
+        self._local_bytes: int = 0
         self._first_packet_ts: float = None
         self._last_packet_ts: float = None
     
@@ -2027,9 +2359,7 @@ different transport or stream ID than the conversation.</p></div>
 
         &#34;&#34;&#34;
         self._packet_count += 1
-        packet_type = packet.highest_layer
-        packet_length = int(packet.length)
-        self._bytes_total += packet_length
+        self._bytes_total += int(packet.length)
         ts = round(float(packet.sniff_timestamp), 3)
         if self._first_packet_ts is None:
             self._first_packet_ts = ts
@@ -2038,9 +2368,10 @@ different transport or stream ID than the conversation.</p></div>
             self._process_arp(packet)
         elif hasattr(packet, &#39;tcp&#39;) or hasattr(packet, &#39;udp&#39;):
             self._process_ip(packet)
+        elif hasattr(packet, &#39;icmp&#39;):
+            self._process_ip(packet)
         else:
-            self._log.warning(f&#39;Unhandled packet type {packet_type}&#39;)
-            return
+            self._process_unhandled(packet)
     
     def _process_arp(self, packet: SharkPacket):
         arp_desc = f&#39;{packet.arp.src_proto_ipv4}--&gt;{packet.arp.dst_proto_ipv4}&#39;
@@ -2051,26 +2382,27 @@ different transport or stream ID than the conversation.</p></div>
 
     def _process_ip(self, packet: SharkPacket):
         in_conversation = False
+        if _is_local_traffic(packet):
+            self._local_packet_count += 1
+            self._local_bytes += int(packet.length)
+            return
         for conversation in self.conversations:
             if conversation.is_packet_in_flow(packet):
                 conversation.packet_add(packet)
                 in_conversation = True
+                break
         if not in_conversation:
             self._log.debug(&#39;Found new conversation&#39;)
             conversation = Conversation(packet, self._log)
             self.conversations.append(conversation)
+
+    def _process_unhandled(self, packet: SharkPacket):
         packet_type = packet.highest_layer
-        packet_length = int(packet.length)
-        ts = round(float(packet.sniff_timestamp), 3)
-        transport = packet.transport_layer
-        if transport is not None:
-            # srcport = packet[transport].srcport   # unused
-            dstport = packet[transport].dstport
-            stream_id = packet[transport].stream
-        isotime = datetime.utcfromtimestamp(ts).isoformat()[0:23]
-        self._log.debug(f&#39;{isotime}|{packet_type}|&#39;
-            f&#39;({transport}.{stream_id}:{dstport})&#39;
-            f&#39;|{packet_length} bytes|{packet.ip.src}--&gt;{packet.ip.dst}&#39;)
+        self._unhandled_packet_count += 1
+        self._unhandled_bytes += int(packet.length)
+        if packet_type not in self._unhandled_packet_types:
+            self._log.warning(f&#39;Unhandled packet type {packet_type}&#39;)
+            self._unhandled_packet_types.append(packet_type)
 
     def data_series_application_size(self) -&gt; dict:
         &#34;&#34;&#34;Returns a set of data series by conversation application.
@@ -2093,19 +2425,71 @@ different transport or stream ID than the conversation.</p></div>
             multi_series[app].sort(key=lambda tup: tup[0])
         return multi_series
 
-    def analyze_conversations(self) -&gt; list:
-        &#34;&#34;&#34;Analyzes the conversations.
+    def analyze_conversations(self) -&gt; dict:
+        &#34;&#34;&#34;Analyzes all conversations to produce a summary.
         
         Returns:
-            A list of analyses currently consisting of the intervals between
-                similarly sized packets of a given application.
+            A dict with keys as unique host pairs &#34;(&#39;A&#39;, &#39;B&#39;)&#34; summary dict:
+                {
+                    count: `int`,
+                    applications: `list[str]`,
+                    start_times: `list[float]`,
+                    packet_intervals: {
+                        AB_intervals: {
+                            &#39;&lt;transport&gt;_&lt;protocol&gt;_&lt;bytesize&gt;&#39;: `int`|`None`,
+                        },
+                        BA_intervals: {
+                            &#39;&lt;transport&gt;_&lt;protocol&gt;_&lt;bytesize&gt;&#39;: `int`|`None`,
+                        }
+                    },
+                    repeat_mean: `int`,
+                    repeat_stdev: `int`
+                }
 
         &#34;&#34;&#34;
+        results = {}
+        for conversation in self.conversations:
+            hosts_str = str(conversation.hosts)
+            intervals = conversation.intervals()
+            intervals.pop(&#39;hosts&#39;, None)
+            i_tag = &#39;packet_intervals&#39;
+            if hosts_str not in results:
+                results[hosts_str] = {
+                    &#39;count&#39;: 1,
+                    &#39;applications&#39;: [conversation.application],
+                    &#39;start_times&#39;: [conversation.start_ts],
+                    i_tag: intervals,
+                }
+            else:
+                results[hosts_str][&#39;count&#39;] += 1
+                app = conversation.application
+                if app not in results[hosts_str][&#39;applications&#39;]:
+                    results[hosts_str][&#39;applications&#39;].append(app)
+                results[hosts_str][&#39;start_times&#39;].append(conversation.start_ts)
+                prior = results[hosts_str][i_tag]
+                results[hosts_str][i_tag] = {**prior, **intervals}
+        for key in results:
+            times = results[key][&#39;start_times&#39;]
+            results[key][&#39;repeat_mean&#39;] = None
+            results[key][&#39;repeat_stdev&#39;] = None
+            if len(times) == 1:
+                continue
+            intervals = []
+            for i, ts in enumerate(times):
+                if i == 0:
+                    continue
+                intervals.append(ts - times[i - 1])
+            if len(intervals) &gt; 1:
+                results[key][&#39;repeat_mean&#39;] = int(statistics.mean(intervals))
+                results[key][&#39;repeat_stdev&#39;] = int(statistics.stdev(intervals))
+        return results
+    
+    def unique_host_pairs(self) -&gt; &#39;list[tuple]&#39;:
+        &#34;&#34;&#34;Lists unique host pairs as tuples.&#34;&#34;&#34;
         results = []
         for conversation in self.conversations:
-            analysis = conversation.intervals()
-            # self._log.info(analysis)
-            results.append(analysis)
+            if conversation.hosts not in results:
+                results.append(conversation.hosts)
         return results</code></pre>
 </details>
 <h3>Instance variables</h3>
@@ -2158,30 +2542,92 @@ def packet_count(self) -&gt; int:
 <h3>Methods</h3>
 <dl>
 <dt id="fieldedge_pcap.pcap.PacketStatistics.analyze_conversations"><code class="name flex">
-<span>def <span class="ident">analyze_conversations</span></span>(<span>self) ‑> list</span>
+<span>def <span class="ident">analyze_conversations</span></span>(<span>self) ‑> dict</span>
 </code></dt>
 <dd>
-<div class="desc"><p>Analyzes the conversations.</p>
+<div class="desc"><p>Analyzes all conversations to produce a summary.</p>
 <h2 id="returns">Returns</h2>
-<p>A list of analyses currently consisting of the intervals between
-similarly sized packets of a given application.</p></div>
+<dl>
+<dt>A dict with keys as unique host pairs "('A', 'B')" summary dict:</dt>
+<dt>{</dt>
+<dt><code>
+count</code></dt>
+<dd><code>int</code>,
+applications: <code>list[str]</code>,
+start_times: <code>list[float]</code>,
+packet_intervals: {
+AB_intervals: {
+'<transport><em><protocol></em><bytesize>': <code>int</code>|<code>None</code>,
+},
+BA_intervals: {
+'<transport><em><protocol></em><bytesize>': <code>int</code>|<code>None</code>,
+}
+},
+repeat_mean: <code>int</code>,
+repeat_stdev: <code>int</code>
+}</dd>
+</dl></div>
 <details class="source">
 <summary>
 <span>Expand source code</span>
 </summary>
-<pre><code class="python">def analyze_conversations(self) -&gt; list:
-    &#34;&#34;&#34;Analyzes the conversations.
+<pre><code class="python">def analyze_conversations(self) -&gt; dict:
+    &#34;&#34;&#34;Analyzes all conversations to produce a summary.
     
     Returns:
-        A list of analyses currently consisting of the intervals between
-            similarly sized packets of a given application.
+        A dict with keys as unique host pairs &#34;(&#39;A&#39;, &#39;B&#39;)&#34; summary dict:
+            {
+                count: `int`,
+                applications: `list[str]`,
+                start_times: `list[float]`,
+                packet_intervals: {
+                    AB_intervals: {
+                        &#39;&lt;transport&gt;_&lt;protocol&gt;_&lt;bytesize&gt;&#39;: `int`|`None`,
+                    },
+                    BA_intervals: {
+                        &#39;&lt;transport&gt;_&lt;protocol&gt;_&lt;bytesize&gt;&#39;: `int`|`None`,
+                    }
+                },
+                repeat_mean: `int`,
+                repeat_stdev: `int`
+            }
 
     &#34;&#34;&#34;
-    results = []
+    results = {}
     for conversation in self.conversations:
-        analysis = conversation.intervals()
-        # self._log.info(analysis)
-        results.append(analysis)
+        hosts_str = str(conversation.hosts)
+        intervals = conversation.intervals()
+        intervals.pop(&#39;hosts&#39;, None)
+        i_tag = &#39;packet_intervals&#39;
+        if hosts_str not in results:
+            results[hosts_str] = {
+                &#39;count&#39;: 1,
+                &#39;applications&#39;: [conversation.application],
+                &#39;start_times&#39;: [conversation.start_ts],
+                i_tag: intervals,
+            }
+        else:
+            results[hosts_str][&#39;count&#39;] += 1
+            app = conversation.application
+            if app not in results[hosts_str][&#39;applications&#39;]:
+                results[hosts_str][&#39;applications&#39;].append(app)
+            results[hosts_str][&#39;start_times&#39;].append(conversation.start_ts)
+            prior = results[hosts_str][i_tag]
+            results[hosts_str][i_tag] = {**prior, **intervals}
+    for key in results:
+        times = results[key][&#39;start_times&#39;]
+        results[key][&#39;repeat_mean&#39;] = None
+        results[key][&#39;repeat_stdev&#39;] = None
+        if len(times) == 1:
+            continue
+        intervals = []
+        for i, ts in enumerate(times):
+            if i == 0:
+                continue
+            intervals.append(ts - times[i - 1])
+        if len(intervals) &gt; 1:
+            results[key][&#39;repeat_mean&#39;] = int(statistics.mean(intervals))
+            results[key][&#39;repeat_stdev&#39;] = int(statistics.stdev(intervals))
     return results</code></pre>
 </details>
 </dd>
@@ -2242,9 +2688,7 @@ tuples with (unix_timestamp, size_bytes)</p></div>
 
     &#34;&#34;&#34;
     self._packet_count += 1
-    packet_type = packet.highest_layer
-    packet_length = int(packet.length)
-    self._bytes_total += packet_length
+    self._bytes_total += int(packet.length)
     ts = round(float(packet.sniff_timestamp), 3)
     if self._first_packet_ts is None:
         self._first_packet_ts = ts
@@ -2253,9 +2697,28 @@ tuples with (unix_timestamp, size_bytes)</p></div>
         self._process_arp(packet)
     elif hasattr(packet, &#39;tcp&#39;) or hasattr(packet, &#39;udp&#39;):
         self._process_ip(packet)
+    elif hasattr(packet, &#39;icmp&#39;):
+        self._process_ip(packet)
     else:
-        self._log.warning(f&#39;Unhandled packet type {packet_type}&#39;)
-        return</code></pre>
+        self._process_unhandled(packet)</code></pre>
+</details>
+</dd>
+<dt id="fieldedge_pcap.pcap.PacketStatistics.unique_host_pairs"><code class="name flex">
+<span>def <span class="ident">unique_host_pairs</span></span>(<span>self) ‑> list[tuple]</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Lists unique host pairs as tuples.</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def unique_host_pairs(self) -&gt; &#39;list[tuple]&#39;:
+    &#34;&#34;&#34;Lists unique host pairs as tuples.&#34;&#34;&#34;
+    results = []
+    for conversation in self.conversations:
+        if conversation.hosts not in results:
+            results.append(conversation.hosts)
+    return results</code></pre>
 </details>
 </dd>
 </dl>
@@ -2314,9 +2777,17 @@ tuples with (unix_timestamp, size_bytes)</p></div>
         self.timestamp = round(float(packet.sniff_timestamp), 3)
         self.size = int(packet.length)
         self.transport = packet.transport_layer
+        if packet.transport_layer:
+            self.transport = packet.transport_layer
+            self.stream_id = str(packet[self.transport].stream)
+        elif hasattr(packet, &#39;icmp&#39;) and packet[&#39;icmp&#39;].udp_port:
+            self.transport = &#39;UDP&#39;
+            self.stream_id = str(packet[&#39;icmp&#39;].udp_stream)
+        else:
+            raise ValueError(&#39;Unable to determine transport&#39;
+                                f&#39; for {packet.highest_layer} packet&#39;)
         self.src, self.dst = _get_src_dst(packet)
-        self.srcport = int(packet[self.transport].srcport)
-        self.dstport = int(packet[self.transport].dstport)
+        self.srcport, self.dstport = _get_ports(packet)
         self.highest_layer = str(packet.highest_layer).upper()
         self.application = _get_application(packet)
         self.a_b = True if self.src == self._parent_hosts[0] else False</code></pre>
@@ -2417,6 +2888,45 @@ tuples with (unix_timestamp, size_bytes)</p></div>
 </ul>
 </li>
 <li>
+<h4><code><a title="fieldedge_pcap.pcap.KnownTcpPorts" href="#fieldedge_pcap.pcap.KnownTcpPorts">KnownTcpPorts</a></code></h4>
+<ul class="two-column">
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.COAP" href="#fieldedge_pcap.pcap.KnownTcpPorts.COAP">COAP</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.COAPS" href="#fieldedge_pcap.pcap.KnownTcpPorts.COAPS">COAPS</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DNP" href="#fieldedge_pcap.pcap.KnownTcpPorts.DNP">DNP</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DNP2" href="#fieldedge_pcap.pcap.KnownTcpPorts.DNP2">DNP2</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DNS" href="#fieldedge_pcap.pcap.KnownTcpPorts.DNS">DNS</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI" href="#fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI">DOCKERAPI</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPIS" href="#fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPIS">DOCKERAPIS</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.FTP" href="#fieldedge_pcap.pcap.KnownTcpPorts.FTP">FTP</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.FTPC" href="#fieldedge_pcap.pcap.KnownTcpPorts.FTPC">FTPC</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.HTTP" href="#fieldedge_pcap.pcap.KnownTcpPorts.HTTP">HTTP</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.HTTP2" href="#fieldedge_pcap.pcap.KnownTcpPorts.HTTP2">HTTP2</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.HTTPS" href="#fieldedge_pcap.pcap.KnownTcpPorts.HTTPS">HTTPS</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.IEC60870" href="#fieldedge_pcap.pcap.KnownTcpPorts.IEC60870">IEC60870</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.IMAP" href="#fieldedge_pcap.pcap.KnownTcpPorts.IMAP">IMAP</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.MODBUS" href="#fieldedge_pcap.pcap.KnownTcpPorts.MODBUS">MODBUS</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.MODBUS_TLS" href="#fieldedge_pcap.pcap.KnownTcpPorts.MODBUS_TLS">MODBUS_TLS</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.MQTT" href="#fieldedge_pcap.pcap.KnownTcpPorts.MQTT">MQTT</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.MQTT_SOCKET" href="#fieldedge_pcap.pcap.KnownTcpPorts.MQTT_SOCKET">MQTT_SOCKET</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.MQTT_TLS" href="#fieldedge_pcap.pcap.KnownTcpPorts.MQTT_TLS">MQTT_TLS</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.RDP" href="#fieldedge_pcap.pcap.KnownTcpPorts.RDP">RDP</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.SMTP" href="#fieldedge_pcap.pcap.KnownTcpPorts.SMTP">SMTP</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.SRCP" href="#fieldedge_pcap.pcap.KnownTcpPorts.SRCP">SRCP</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.SSH" href="#fieldedge_pcap.pcap.KnownTcpPorts.SSH">SSH</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.TELNET" href="#fieldedge_pcap.pcap.KnownTcpPorts.TELNET">TELNET</a></code></li>
+</ul>
+</li>
+<li>
+<h4><code><a title="fieldedge_pcap.pcap.KnownUdpPorts" href="#fieldedge_pcap.pcap.KnownUdpPorts">KnownUdpPorts</a></code></h4>
+<ul class="">
+<li><code><a title="fieldedge_pcap.pcap.KnownUdpPorts.DHCP_QUERY" href="#fieldedge_pcap.pcap.KnownUdpPorts.DHCP_QUERY">DHCP_QUERY</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownUdpPorts.DHCP_RESPONSE" href="#fieldedge_pcap.pcap.KnownUdpPorts.DHCP_RESPONSE">DHCP_RESPONSE</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownUdpPorts.DNS" href="#fieldedge_pcap.pcap.KnownUdpPorts.DNS">DNS</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownUdpPorts.NTP" href="#fieldedge_pcap.pcap.KnownUdpPorts.NTP">NTP</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownUdpPorts.SNMP" href="#fieldedge_pcap.pcap.KnownUdpPorts.SNMP">SNMP</a></code></li>
+</ul>
+</li>
+<li>
 <h4><code><a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></code></h4>
 <ul class="">
 <li><code><a title="fieldedge_pcap.pcap.PacketStatistics.analyze_conversations" href="#fieldedge_pcap.pcap.PacketStatistics.analyze_conversations">analyze_conversations</a></code></li>
@@ -2425,6 +2935,7 @@ tuples with (unix_timestamp, size_bytes)</p></div>
 <li><code><a title="fieldedge_pcap.pcap.PacketStatistics.duration" href="#fieldedge_pcap.pcap.PacketStatistics.duration">duration</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.PacketStatistics.packet_add" href="#fieldedge_pcap.pcap.PacketStatistics.packet_add">packet_add</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.PacketStatistics.packet_count" href="#fieldedge_pcap.pcap.PacketStatistics.packet_count">packet_count</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.PacketStatistics.unique_host_pairs" href="#fieldedge_pcap.pcap.PacketStatistics.unique_host_pairs">unique_host_pairs</a></code></li>
 </ul>
 </li>
 <li>

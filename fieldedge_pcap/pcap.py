@@ -13,8 +13,9 @@ report by exception be used with a less frequent update pushed?
 """
 import asyncio
 import json
-import logging
 import os
+import statistics
+from logging import Logger
 from multiprocessing import Queue
 from datetime import datetime
 from enum import Enum
@@ -53,6 +54,41 @@ class EthernetProtocol(Enum):
     ETH_TYPE_TEB = 0x6558  # Transparent Ethernet Bridging
 
 # Common/registered IP protocol ports
+class KnownTcpPorts(Enum):
+    """Mappings for application layer ports."""
+    SMTP = 25
+    HTTP = 80
+    HTTPS = 443
+    DNS = 53
+    FTP = 20
+    FTPC = 21
+    TELNET = 23
+    IMAP = 143
+    RDP = 3389
+    SSH = 22
+    HTTP2 = 8080
+    MODBUS = 502
+    MODBUS_TLS = 802
+    MQTT = 1883
+    MQTT_TLS = 8883
+    MQTT_SOCKET = 9001
+    DOCKERAPI = 2375
+    DOCKERAPIS = 2376
+    SRCP = 4303
+    COAP = 5683
+    COAPS = 5684
+    DNP2 = 19999
+    DNP = 20000
+    IEC60870 = 2404
+
+class KnownUdpPorts(Enum):
+    SNMP = 161
+    DNS = 53
+    DHCP_QUERY = 67
+    DHCP_RESPONSE = 68
+    NTP = 123
+
+
 class ApplicationPort(Enum):
     """Mappings for application layer ports."""
     TCP_SMTP = 25
@@ -112,11 +148,19 @@ def _get_ports(packet: SharkPacket) -> tuple:
     Returns:
         A tuple with (source, destination) ports (TCP or UDP)
     """
-    transport_layer = packet[packet.transport_layer]
-    return (int(transport_layer.srcport), int(transport_layer.dstport))
+    if packet.transport_layer:
+        srcport = int(packet[packet.transport_layer].srcport)
+        dstport = int(packet[packet.transport_layer].dstport)
+    elif hasattr(packet, 'icmp') and packet['icmp'].udp_port:
+        srcport = int(packet['icmp'].udp_srcport)
+        dstport = int(packet['icmp'].udp_dstport)
+    else:
+        raise ValueError('Unable to determine transport'
+                            f' for {packet.highest_layer} packet')
+    return (srcport, dstport)
 
 
-def _get_application(packet: SharkPacket) -> str:
+def _get_application(packet: SharkPacket, log: Logger = None) -> str:
     """Returns the application layer descriptor.
     
     If the port is a registered port it will return a caps string.
@@ -127,28 +171,39 @@ def _get_application(packet: SharkPacket) -> str:
     Returns:
         A string with the application layer protocol e.g. `TCP_MQTTS`
     """
-    application = 'UNKNOWN'
+    if not log:
+        log = get_wrapping_logger()
+    application = None
     if hasattr(packet[packet.highest_layer], 'app_data_proto'):
         application = str(packet[packet.highest_layer].app_data_proto).upper()
-    else:
+    elif packet.transport_layer:
         (srcport, dstport) = _get_ports(packet)
-        known_ports = tuple(item.value for item in ApplicationPort)
-        application = str(packet.highest_layer).upper()
-        if srcport in known_ports:
-            application = ApplicationPort(srcport).name
-        elif dstport in known_ports:
-            application = ApplicationPort(dstport).name
-        elif (application == packet.transport_layer):
-            application = f'UNKNOWN_{srcport}_{dstport}'
-            if dstport < srcport:
-                application = f'UNKNOWN_{dstport}_{srcport}'
-    if f'{packet.transport_layer}' not in application:
-        application = f'{packet.transport_layer}_{application}'
+        if packet.transport_layer == 'TCP':
+            known_ports = tuple(item.value for item in KnownTcpPorts)
+            if srcport in known_ports:
+                application = f'TCP_{KnownTcpPorts(srcport).name}'
+            elif dstport in known_ports:
+                application = f'TCP_{KnownTcpPorts(dstport).name}'
+        elif packet.transport_layer == 'UDP':
+            known_ports = tuple(item.value for item in KnownUdpPorts)
+            if srcport in known_ports:
+                application = f'UDP_{KnownUdpPorts(srcport).name}'
+            elif dstport in known_ports:
+                application = f'UDP_{KnownUdpPorts(dstport).name}'
+        if not application and packet.transport_layer != packet.highest_layer:
+            application = (f'{str(packet.transport_layer).upper()}_'
+                           f'{str(packet.highest_layer).upper()}')
+    else:
+        try:
+            transport_layer = str(packet.layers[2].layer_name).upper()
+            highest_layer = str(packet.highest_layer).upper()
+            application = f'{transport_layer}_{highest_layer}'
+        except Exception as err:
+            log.error(err)
+            application = f'{str(packet.highest_layer).upper()}'
     # identified workarounds for observed pyshark/tshark app_data_proto
     if 'HTTP-OVER-TLS' in application:
         application = application.replace('HTTP-OVER-TLS', 'HTTPS')
-    if packet.highest_layer == 'TLS' and not application.endswith('S'):
-        application = f'{application}S'
     return application
 
 
@@ -205,6 +260,12 @@ def _is_local_traffic(packet: SharkPacket) -> bool:
         return True
     return False
 
+def _is_invalid_traffic(packet: SharkPacket) -> bool:
+    src, dst = _get_src_dst(packet)
+    if (src == '0.0.0.0' or dst == '0.0.0.0'):
+        return True
+    return False
+
 
 class SimplePacket:
     """A simplified packet representation.
@@ -227,9 +288,17 @@ class SimplePacket:
         self.timestamp = round(float(packet.sniff_timestamp), 3)
         self.size = int(packet.length)
         self.transport = packet.transport_layer
+        if packet.transport_layer:
+            self.transport = packet.transport_layer
+            self.stream_id = str(packet[self.transport].stream)
+        elif hasattr(packet, 'icmp') and packet['icmp'].udp_port:
+            self.transport = 'UDP'
+            self.stream_id = str(packet['icmp'].udp_stream)
+        else:
+            raise ValueError('Unable to determine transport'
+                                f' for {packet.highest_layer} packet')
         self.src, self.dst = _get_src_dst(packet)
-        self.srcport = int(packet[self.transport].srcport)
-        self.dstport = int(packet[self.transport].dstport)
+        self.srcport, self.dstport = _get_ports(packet)
         self.highest_layer = str(packet.highest_layer).upper()
         self.application = _get_application(packet)
         self.a_b = True if self.src == self._parent_hosts[0] else False
@@ -251,7 +320,7 @@ class Conversation:
         bytes_total: The total number of bytes in the conversation
 
     """
-    def __init__(self, packet: SharkPacket = None, log: logging.Logger = None):
+    def __init__(self, packet: SharkPacket = None, log: Logger = None):
         self._log = log or get_wrapping_logger()
         self.application: str = None
         self.hosts: tuple = None
@@ -263,6 +332,7 @@ class Conversation:
         self.packets: list[SimplePacket] = []
         self.packet_count: int = 0
         self.bytes_total: int = 0
+        self.start_ts: float = None
         if packet is not None:
             self.packet_add(packet)
     
@@ -281,12 +351,19 @@ class Conversation:
         if self.hosts is None:
             return False
         (src, dst) = _get_src_dst(packet)
-        try:
+        if _is_local_traffic(packet):
+            return False
+        stream_id = None
+        if packet.transport_layer:
             transport = packet.transport_layer
-            stream_id = packet[transport].stream
-        except AttributeError as err:
-            self._log.exception(f'{err}')
+            try:
+                stream_id = packet[transport].stream
+            except AttributeError as err:
+                self._log.exception(f'{err}')
+        elif hasattr(packet, 'icmp') and packet['icmp'].udp_stream:
+            stream_id = packet['icmp'].udp_stream
         if (src in self.hosts and dst in self.hosts and
+            stream_id is not None and
             stream_id == self.stream_id):
             return True
         return False
@@ -311,41 +388,38 @@ class Conversation:
             self.hosts = _get_src_dst(packet)
         elif not(self.is_packet_in_flow(packet)):
             return False
-        (src, dst) = _get_src_dst(packet)
-        del dst   #:Unused
-        if src == self.hosts[0]:
+        try:
+            simple_packet = SimplePacket(packet, self.hosts)
+        except Exception as err:
+            self._log.error(err)
+            raise err
+        isotime = datetime.utcfromtimestamp(simple_packet.timestamp).isoformat()[0:23]
+        self._log.debug(f'{isotime}|{simple_packet.application}|'
+            f'({simple_packet.transport}.{simple_packet.stream_id}:{simple_packet.dstport})'
+            f'|{simple_packet.size} bytes|{simple_packet.src}-->{simple_packet.dst}')
+        if simple_packet.src == self.hosts[0]:
             self.a_b += 1
         else:
             self.b_a += 1
         if self.transport is None:
-            if packet.transport_layer is None:
-                err = f'Packet missing transport_layer'
-                self._log.error(err)
-                raise ValueError(err)
-            self.transport = packet.transport_layer
-        elif packet.transport_layer != self.transport:
-            err = (f'Expected transport {self.transport}'
-                f' got {packet.transport_layer}')
-            self._log.error(err)
-            raise ValueError(err)
-        srcport = int(packet[self.transport].srcport)
-        if srcport not in self.ports:
-            self.ports.append(srcport)
-        dstport = int(packet[self.transport].dstport)
-        if dstport not in self.ports:
-            self.ports.append(dstport)
-        stream_id = packet[self.transport].stream
+            self.transport = simple_packet.transport
+        if simple_packet.srcport not in self.ports:
+            self.ports.append(simple_packet.srcport)
+        if simple_packet.dstport not in self.ports:
+            self.ports.append(simple_packet.dstport)
         if self.stream_id is None:
-            self.stream_id = stream_id
-        elif stream_id != self.stream_id:
+            self.stream_id = simple_packet.stream_id
+        elif simple_packet.stream_id != self.stream_id:
             err = (f'Expected stream {self.stream_id}'
-                f' got {packet[self.transport].stream}')
-            self._log.error(err)
+                   f' but got {simple_packet.stream_id}')
+            # self._log.error(err)
             raise ValueError(err)
         self.packet_count += 1
-        self.bytes_total += int(packet.length)
+        self.bytes_total += simple_packet.size
+        if self.start_ts is None:
+            self.start_ts = simple_packet.timestamp
+        # TODO: can likely remove the try/except below
         try:
-            simple_packet = SimplePacket(packet, self.hosts)
             self.packets.append(simple_packet)
             if self.application is None:
                 self.application = simple_packet.application
@@ -449,8 +523,7 @@ class Conversation:
         packets_a_b, packets_b_a = self.group_packets_by_size()
         # TODO: dominant packet list based on quantity * size
         return {
-            'A': self.hosts[0],
-            'B': self.hosts[1],
+            'hosts': self.hosts,
             'AB_intervals': self._get_intervals_by_length(packets_a_b),
             'BA_intervals': self._get_intervals_by_length(packets_b_a)
         }
@@ -466,7 +539,7 @@ class PacketStatistics:
 
     """
     def __init__(self,
-                 log: logging.Logger = None,
+                 log: Logger = None,
                  source_filename: str = None,
                  ) -> None:
         """Creates a PacketStatistics object.
@@ -480,7 +553,12 @@ class PacketStatistics:
         self._source_filename: str = source_filename
         self.conversations: list[Conversation] = []
         self._packet_count: int = 0
+        self._unhandled_packet_types: list = []
+        self._unhandled_packet_count: int = 0
+        self._local_packet_count: int = 0
         self._bytes_total: int = 0
+        self._unhandled_bytes: int = 0
+        self._local_bytes: int = 0
         self._first_packet_ts: float = None
         self._last_packet_ts: float = None
     
@@ -512,9 +590,7 @@ class PacketStatistics:
 
         """
         self._packet_count += 1
-        packet_type = packet.highest_layer
-        packet_length = int(packet.length)
-        self._bytes_total += packet_length
+        self._bytes_total += int(packet.length)
         ts = round(float(packet.sniff_timestamp), 3)
         if self._first_packet_ts is None:
             self._first_packet_ts = ts
@@ -523,9 +599,10 @@ class PacketStatistics:
             self._process_arp(packet)
         elif hasattr(packet, 'tcp') or hasattr(packet, 'udp'):
             self._process_ip(packet)
+        elif hasattr(packet, 'icmp'):
+            self._process_ip(packet)
         else:
-            self._log.warning(f'Unhandled packet type {packet_type}')
-            return
+            self._process_unhandled(packet)
     
     def _process_arp(self, packet: SharkPacket):
         arp_desc = f'{packet.arp.src_proto_ipv4}-->{packet.arp.dst_proto_ipv4}'
@@ -536,26 +613,27 @@ class PacketStatistics:
 
     def _process_ip(self, packet: SharkPacket):
         in_conversation = False
+        if _is_local_traffic(packet):
+            self._local_packet_count += 1
+            self._local_bytes += int(packet.length)
+            return
         for conversation in self.conversations:
             if conversation.is_packet_in_flow(packet):
                 conversation.packet_add(packet)
                 in_conversation = True
+                break
         if not in_conversation:
             self._log.debug('Found new conversation')
             conversation = Conversation(packet, self._log)
             self.conversations.append(conversation)
+
+    def _process_unhandled(self, packet: SharkPacket):
         packet_type = packet.highest_layer
-        packet_length = int(packet.length)
-        ts = round(float(packet.sniff_timestamp), 3)
-        transport = packet.transport_layer
-        if transport is not None:
-            # srcport = packet[transport].srcport   # unused
-            dstport = packet[transport].dstport
-            stream_id = packet[transport].stream
-        isotime = datetime.utcfromtimestamp(ts).isoformat()[0:23]
-        self._log.debug(f'{isotime}|{packet_type}|'
-            f'({transport}.{stream_id}:{dstport})'
-            f'|{packet_length} bytes|{packet.ip.src}-->{packet.ip.dst}')
+        self._unhandled_packet_count += 1
+        self._unhandled_bytes += int(packet.length)
+        if packet_type not in self._unhandled_packet_types:
+            self._log.warning(f'Unhandled packet type {packet_type}')
+            self._unhandled_packet_types.append(packet_type)
 
     def data_series_application_size(self) -> dict:
         """Returns a set of data series by conversation application.
@@ -578,19 +656,71 @@ class PacketStatistics:
             multi_series[app].sort(key=lambda tup: tup[0])
         return multi_series
 
-    def analyze_conversations(self) -> list:
-        """Analyzes the conversations.
+    def analyze_conversations(self) -> dict:
+        """Analyzes all conversations to produce a summary.
         
         Returns:
-            A list of analyses currently consisting of the intervals between
-                similarly sized packets of a given application.
+            A dict with keys as unique host pairs "('A', 'B')" summary dict:
+                {
+                    count: `int`,
+                    applications: `list[str]`,
+                    start_times: `list[float]`,
+                    packet_intervals: {
+                        AB_intervals: {
+                            '<transport>_<protocol>_<bytesize>': `int`|`None`,
+                        },
+                        BA_intervals: {
+                            '<transport>_<protocol>_<bytesize>': `int`|`None`,
+                        }
+                    },
+                    repeat_mean: `int`,
+                    repeat_stdev: `int`
+                }
 
         """
+        results = {}
+        for conversation in self.conversations:
+            hosts_str = str(conversation.hosts)
+            intervals = conversation.intervals()
+            intervals.pop('hosts', None)
+            i_tag = 'packet_intervals'
+            if hosts_str not in results:
+                results[hosts_str] = {
+                    'count': 1,
+                    'applications': [conversation.application],
+                    'start_times': [conversation.start_ts],
+                    i_tag: intervals,
+                }
+            else:
+                results[hosts_str]['count'] += 1
+                app = conversation.application
+                if app not in results[hosts_str]['applications']:
+                    results[hosts_str]['applications'].append(app)
+                results[hosts_str]['start_times'].append(conversation.start_ts)
+                prior = results[hosts_str][i_tag]
+                results[hosts_str][i_tag] = {**prior, **intervals}
+        for key in results:
+            times = results[key]['start_times']
+            results[key]['repeat_mean'] = None
+            results[key]['repeat_stdev'] = None
+            if len(times) == 1:
+                continue
+            intervals = []
+            for i, ts in enumerate(times):
+                if i == 0:
+                    continue
+                intervals.append(ts - times[i - 1])
+            if len(intervals) > 1:
+                results[key]['repeat_mean'] = int(statistics.mean(intervals))
+                results[key]['repeat_stdev'] = int(statistics.stdev(intervals))
+        return results
+    
+    def unique_host_pairs(self) -> 'list[tuple]':
+        """Lists unique host pairs as tuples."""
         results = []
         for conversation in self.conversations:
-            analysis = conversation.intervals()
-            # self._log.info(analysis)
-            results.append(analysis)
+            if conversation.hosts not in results:
+                results.append(conversation.hosts)
         return results
 
 
@@ -662,17 +792,19 @@ def process_pcap(filename: str,
     packet_number = 0
     for packet in capture:
         packet_number += 1
+        if packet_number == 0:
+            log.info('Problem packet...')
         try:
             packet_stats.packet_add(packet)
         except NotImplementedError as err:
             log.error(f'pyshark: {err}')
         except TSharkCrashException as err:
-            log.error(f'{err}')
+            log.error(f'tshark: {err}')
             break
-        except Exception as err:
+        except Exception:
             #TODO: better error capture e.g. appears to have been cut short use editcap
             # https://tshark.dev/share/pcap_preparation/
-            log.exception(f'Packet {packet_number} processing ERROR:\n{err}')
+            log.exception(f'Packet {packet_number} processing ERROR')
             break
     capture.close()
     if newloop:
@@ -703,7 +835,7 @@ def create_pcap(interface: str = 'eth1',
                 target_directory: str = '$HOME',
                 queue: Queue = None,
                 debug: bool = False,
-                log: logging.Logger = None,
+                log: Logger = None,
                 ) -> str:
     """Creates a packet capture file of a specified interface.
 
@@ -718,8 +850,8 @@ def create_pcap(interface: str = 'eth1',
     kwargs = {
         'interface': my_interface,
         'duration': my_duration,
-        'filename': pcap_filename(),
-        'target_directory': my_folder,
+        'filename': pcap_filename(duration),
+        'target_directory': parent_folder,
         'queue': queue,
     }
     capture_process = multiprocessing.Process(target=create_pcap,

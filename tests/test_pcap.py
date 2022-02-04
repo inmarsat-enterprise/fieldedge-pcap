@@ -152,3 +152,27 @@ def test_process():
     packet_stats = pcap.process_pcap(filename=filename)
     processing_time = time() - starttime
     assert isinstance(packet_stats, pcap.PacketStatistics)
+
+def test_unique_hosts():
+    filename = f'{TEST_DIR}/capture_20211215T031635_3600.pcap'
+    packet_stats = pcap.process_pcap(filename=filename)
+    unique_hosts = packet_stats.unique_host_pairs()
+    temp = []
+    for hostpair in unique_hosts:
+        assert hostpair not in temp
+        temp.append(hostpair)
+
+def test_analyze_conversations():
+    filename = f'{TEST_DIR}/capture_20211215T031635_3600.pcap'
+    # filename = f'{TEST_DIR}/capture_20220119T000001_60.pcap'
+    packet_stats = pcap.process_pcap(filename=filename)
+    analysis = packet_stats.analyze_conversations()
+    assert isinstance(analysis, dict) and len(analysis) > 0
+    for hostpair, summary in analysis.items():
+        assert isinstance(summary, dict)
+        assert summary['count'] > 0
+        assert len(summary['applications']) > 0
+        assert len(summary['start_times']) == summary['count']
+        assert 'packet_intervals' in summary
+        assert 'repeat_mean' in summary
+        assert 'repeat_stdev' in summary
