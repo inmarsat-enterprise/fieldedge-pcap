@@ -229,9 +229,12 @@ def _get_application(packet: SharkPacket, log: Logger = None) -&gt; str:
                 application = f&#39;UDP_{KnownUdpPorts(srcport).name}&#39;
             elif dstport in known_ports:
                 application = f&#39;UDP_{KnownUdpPorts(dstport).name}&#39;
-        if not application and packet.transport_layer != packet.highest_layer:
-            application = (f&#39;{str(packet.transport_layer).upper()}_&#39;
-                           f&#39;{str(packet.highest_layer).upper()}&#39;)
+        if not application:   # and packet.transport_layer != packet.highest_layer:
+            application = f&#39;{str(packet.transport_layer).upper()}&#39;
+            if packet.transport_layer != packet.highest_layer:
+                application += f&#39;_{str(packet.highest_layer).upper()}&#39;
+            else:
+                application += f&#39;_{dstport}&#39;
     else:
         try:
             transport_layer = str(packet.layers[2].layer_name).upper()
@@ -241,6 +244,8 @@ def _get_application(packet: SharkPacket, log: Logger = None) -&gt; str:
             log.error(err)
             application = f&#39;{str(packet.highest_layer).upper()}&#39;
     # identified workarounds for observed pyshark/tshark app_data_proto
+    if not application:
+        application = f&#39;{str(packet.highest_layer).upper()}_UNKNOWN&#39;
     if &#39;HTTP-OVER-TLS&#39; in application:
         application = application.replace(&#39;HTTP-OVER-TLS&#39;, &#39;HTTPS&#39;)
     return application
@@ -286,7 +291,7 @@ def is_private_ip(ip_addr: str) -&gt; bool:
 
 
 def _is_local_traffic(packet: SharkPacket) -&gt; bool:
-    &#34;&#34;&#34;Returns true if the source and destination addresses are on the LAN.
+    &#34;&#34;&#34;Returns true if the source is on the LAN and destinations are cast.
     
     Args:
         packet: A pyshark Packet capture
@@ -294,15 +299,17 @@ def _is_local_traffic(packet: SharkPacket) -&gt; bool:
     Returns:
         True if both addresses are in the LAN range 192.168.x.y 
     &#34;&#34;&#34;
+    CAST_ADDRESSES = [
+        &#39;255.255.255.255&#39;,
+    ]
+    MULTICAST_RANGE = (224, 239)
     src, dst = _get_src_dst(packet)
-    if ((src.startswith(&#39;192.168.&#39;) and dst.startswith(&#39;192.168.&#39;))):
-        return True
-    return False
-
-def _is_invalid_traffic(packet: SharkPacket) -&gt; bool:
-    src, dst = _get_src_dst(packet)
-    if (src == &#39;0.0.0.0&#39; or dst == &#39;0.0.0.0&#39;):
-        return True
+    if src.startswith(&#39;192.168.&#39;):
+        dst_first_octet = int(dst.split(&#39;.&#39;)[0])
+        if (dst in CAST_ADDRESSES or 
+            dst_first_octet &gt;= MULTICAST_RANGE[0] and
+            dst_first_octet &lt;= MULTICAST_RANGE[1]):
+            return True
     return False
 
 
@@ -831,7 +838,7 @@ def process_pcap(filename: str,
     packet_number = 0
     for packet in capture:
         packet_number += 1
-        if packet_number == 0:
+        if packet_number == 15:
             log.info(&#39;Problem packet...&#39;)
         try:
             packet_stats.packet_add(packet)
@@ -952,7 +959,7 @@ def create_pcap(interface: str = &#39;eth1&#39;,
 <h2 class="section-title" id="header-functions">Functions</h2>
 <dl>
 <dt id="fieldedge_pcap.pcap.create_pcap"><code class="name flex">
-<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10af89cf8>> = None, debug: bool = False, log: logging.Logger = None) ‑> str</span>
+<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10e176da0>> = None, debug: bool = False, log: logging.Logger = None) ‑> str</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Creates a packet capture file of a specified interface.</p>
@@ -1177,7 +1184,7 @@ should have a returncode 0.</p>
 </details>
 </dd>
 <dt id="fieldedge_pcap.pcap.process_pcap"><code class="name flex">
-<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10af89cf8>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
+<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10e176da0>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
 </code></dt>
 <dd>
 <div class="desc"><p>Processes a PCAP file to create metrics for conversations.</p>
@@ -1274,7 +1281,7 @@ process.join()
     packet_number = 0
     for packet in capture:
         packet_number += 1
-        if packet_number == 0:
+        if packet_number == 15:
             log.info(&#39;Problem packet...&#39;)
         try:
             packet_stats.packet_add(packet)
