@@ -190,9 +190,12 @@ def _get_application(packet: SharkPacket, log: Logger = None) -> str:
                 application = f'UDP_{KnownUdpPorts(srcport).name}'
             elif dstport in known_ports:
                 application = f'UDP_{KnownUdpPorts(dstport).name}'
-        if not application and packet.transport_layer != packet.highest_layer:
-            application = (f'{str(packet.transport_layer).upper()}_'
-                           f'{str(packet.highest_layer).upper()}')
+        if not application:   # and packet.transport_layer != packet.highest_layer:
+            application = f'{str(packet.transport_layer).upper()}'
+            if packet.transport_layer != packet.highest_layer:
+                application += f'_{str(packet.highest_layer).upper()}'
+            else:
+                application += f'_{dstport}'
     else:
         try:
             transport_layer = str(packet.layers[2].layer_name).upper()
@@ -202,6 +205,8 @@ def _get_application(packet: SharkPacket, log: Logger = None) -> str:
             log.error(err)
             application = f'{str(packet.highest_layer).upper()}'
     # identified workarounds for observed pyshark/tshark app_data_proto
+    if not application:
+        application = f'{str(packet.highest_layer).upper()}_UNKNOWN'
     if 'HTTP-OVER-TLS' in application:
         application = application.replace('HTTP-OVER-TLS', 'HTTPS')
     return application
@@ -247,7 +252,7 @@ def is_private_ip(ip_addr: str) -> bool:
 
 
 def _is_local_traffic(packet: SharkPacket) -> bool:
-    """Returns true if the source and destination addresses are on the LAN.
+    """Returns true if the source is on the LAN and destinations are cast.
     
     Args:
         packet: A pyshark Packet capture
@@ -255,15 +260,17 @@ def _is_local_traffic(packet: SharkPacket) -> bool:
     Returns:
         True if both addresses are in the LAN range 192.168.x.y 
     """
+    CAST_ADDRESSES = [
+        '255.255.255.255',
+    ]
+    MULTICAST_RANGE = (224, 239)
     src, dst = _get_src_dst(packet)
-    if ((src.startswith('192.168.') and dst.startswith('192.168.'))):
-        return True
-    return False
-
-def _is_invalid_traffic(packet: SharkPacket) -> bool:
-    src, dst = _get_src_dst(packet)
-    if (src == '0.0.0.0' or dst == '0.0.0.0'):
-        return True
+    if src.startswith('192.168.'):
+        dst_first_octet = int(dst.split('.')[0])
+        if (dst in CAST_ADDRESSES or 
+            dst_first_octet >= MULTICAST_RANGE[0] and
+            dst_first_octet <= MULTICAST_RANGE[1]):
+            return True
     return False
 
 
@@ -792,7 +799,7 @@ def process_pcap(filename: str,
     packet_number = 0
     for packet in capture:
         packet_number += 1
-        if packet_number == 0:
+        if packet_number == 15:
             log.info('Problem packet...')
         try:
             packet_stats.packet_add(packet)

@@ -163,7 +163,8 @@ def test_unique_hosts():
         temp.append(hostpair)
 
 def test_analyze_conversations():
-    filename = f'{TEST_DIR}/capture_20211215T031635_3600.pcap'
+    filename = f'{TEST_DIR}/capture_20220303T021914_60_eth0.pcap'
+    # filename = f'{TEST_DIR}/capture_20211215T031635_3600.pcap'
     # filename = f'{TEST_DIR}/capture_20220119T000001_60.pcap'
     packet_stats = pcap.process_pcap(filename=filename)
     analysis = packet_stats.analyze_conversations()
