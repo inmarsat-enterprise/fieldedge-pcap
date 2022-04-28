@@ -13,22 +13,21 @@ report by exception be used with a less frequent update pushed?
 """
 import asyncio
 import json
+import logging
 import os
 import statistics
-from logging import Logger
-from multiprocessing import Queue
 from datetime import datetime
 from enum import Enum
+from multiprocessing import Queue
+from pathlib import Path
 
 import pyshark
-from pyshark.packet.packet import Packet as SharkPacket
 from pyshark.capture.capture import TSharkCrashException
+from pyshark.packet.packet import Packet as SharkPacket
 
-from fieldedge_utilities.logger import get_wrapping_logger
-from fieldedge_utilities.path import clean_path
+_log = logging.getLogger(__name__)
 
 
-# Ethernet packet types
 class EthernetProtocol(Enum):
     """Mappings for Ethernet packet types."""
     ETH_TYPE_EDP = 0x00bb  # Extreme Networks Discovery Protocol
@@ -53,9 +52,9 @@ class EthernetProtocol(Enum):
     ETH_TYPE_LLDP = 0x88CC  # Link Layer Discovery Protocol
     ETH_TYPE_TEB = 0x6558  # Transparent Ethernet Bridging
 
-# Common/registered IP protocol ports
+
 class KnownTcpPorts(Enum):
-    """Mappings for application layer ports."""
+    """Mappings for common registered/known application layer TCP ports."""
     SMTP = 25
     HTTP = 80
     HTTPS = 443
@@ -81,44 +80,14 @@ class KnownTcpPorts(Enum):
     DNP = 20000
     IEC60870 = 2404
 
+
 class KnownUdpPorts(Enum):
+    """Mappings for common registered/known application layer TCP ports."""
     SNMP = 161
     DNS = 53
     DHCP_QUERY = 67
     DHCP_RESPONSE = 68
     NTP = 123
-
-
-class ApplicationPort(Enum):
-    """Mappings for application layer ports."""
-    TCP_SMTP = 25
-    TCP_HTTP = 80
-    TCP_HTTPS = 443
-    TCP_DNS = 53
-    TCP_FTP = 20
-    TCP_FTPC = 21
-    TCP_TELNET = 23
-    TCP_IMAP = 143
-    TCP_RDP = 3389
-    TCP_SSH = 22
-    TCP_HTTP2 = 8080
-    TCP_MODBUS = 502
-    TCP_MODBUSS = 802
-    TCP_MQTT = 1883
-    TCP_MQTTS = 8883
-    TCP_DOCKERAPI = 2375
-    TCP_DOCKERAPIS = 2376
-    TCP_SRCP = 4303
-    TCP_COAP = 5683
-    TCP_COAPS = 5684
-    TCP_DNP2 = 19999
-    TCP_DNP = 20000
-    TCP_IEC60870 = 2404
-    UDP_SNMP = 161
-    UDP_DNS = 53
-    UDP_DHCPQ = 67
-    UDP_DHCPR = 68
-    UDP_NTP = 123
 
 
 def _get_src_dst(packet: SharkPacket) -> tuple:
@@ -160,7 +129,7 @@ def _get_ports(packet: SharkPacket) -> tuple:
     return (srcport, dstport)
 
 
-def _get_application(packet: SharkPacket, log: Logger = None) -> str:
+def _get_application(packet: SharkPacket) -> str:
     """Returns the application layer descriptor.
     
     If the port is a registered port it will return a caps string.
@@ -171,8 +140,6 @@ def _get_application(packet: SharkPacket, log: Logger = None) -> str:
     Returns:
         A string with the application layer protocol e.g. `TCP_MQTTS`
     """
-    if not log:
-        log = get_wrapping_logger()
     application = None
     if hasattr(packet[packet.highest_layer], 'app_data_proto'):
         application = str(packet[packet.highest_layer].app_data_proto).upper()
@@ -202,7 +169,7 @@ def _get_application(packet: SharkPacket, log: Logger = None) -> str:
             highest_layer = str(packet.highest_layer).upper()
             application = f'{transport_layer}_{highest_layer}'
         except Exception as err:
-            log.error(err)
+            _log.error(err)
             application = f'{str(packet.highest_layer).upper()}'
     # identified workarounds for observed pyshark/tshark app_data_proto
     if not application:
@@ -274,6 +241,25 @@ def _is_local_traffic(packet: SharkPacket) -> bool:
     return False
 
 
+def _clean_path(pathname: str) -> str:
+    """Adjusts relative and shorthand filenames for OS independence.
+    
+    Args:
+        pathname: The full path/to/file
+    
+    Returns:
+        A clean file/path name for the current OS and directory structure.
+    """
+    if pathname.startswith('$HOME/'):
+        pathname = pathname.replace('$HOME', str(Path.home()), 1)
+    elif pathname.startswith('~/'):
+        pathname = pathname.replace('~', str(Path.home()), 1)
+    if os.path.isdir(os.path.dirname(pathname)):
+        return os.path.realpath(pathname)
+    else:
+        raise ValueError(f'Directory {os.path.dirname(pathname)} not found')
+
+
 class SimplePacket:
     """A simplified packet representation.
     
@@ -327,8 +313,7 @@ class Conversation:
         bytes_total: The total number of bytes in the conversation
 
     """
-    def __init__(self, packet: SharkPacket = None, log: Logger = None):
-        self._log = log or get_wrapping_logger()
+    def __init__(self, packet: SharkPacket = None):
         self.application: str = None
         self.hosts: tuple = None
         self.a_b: int = 0
@@ -366,7 +351,7 @@ class Conversation:
             try:
                 stream_id = packet[transport].stream
             except AttributeError as err:
-                self._log.exception(f'{err}')
+                _log.exception(f'{err}')
         elif hasattr(packet, 'icmp') and packet['icmp'].udp_stream:
             stream_id = packet['icmp'].udp_stream
         if (src in self.hosts and dst in self.hosts and
@@ -398,12 +383,14 @@ class Conversation:
         try:
             simple_packet = SimplePacket(packet, self.hosts)
         except Exception as err:
-            self._log.error(err)
+            _log.error(err)
             raise err
         isotime = datetime.utcfromtimestamp(simple_packet.timestamp).isoformat()[0:23]
-        self._log.debug(f'{isotime}|{simple_packet.application}|'
-            f'({simple_packet.transport}.{simple_packet.stream_id}:{simple_packet.dstport})'
-            f'|{simple_packet.size} bytes|{simple_packet.src}-->{simple_packet.dst}')
+        _log.debug(f'{isotime}|{simple_packet.application}|'
+                   f'({simple_packet.transport}.{simple_packet.stream_id}'
+                   f':{simple_packet.dstport})'
+                   f'|{simple_packet.size} bytes'
+                   f'|{simple_packet.src}-->{simple_packet.dst}')
         if simple_packet.src == self.hosts[0]:
             self.a_b += 1
         else:
@@ -419,7 +406,7 @@ class Conversation:
         elif simple_packet.stream_id != self.stream_id:
             err = (f'Expected stream {self.stream_id}'
                    f' but got {simple_packet.stream_id}')
-            # self._log.error(err)
+            _log.error(err)
             raise ValueError(err)
         self.packet_count += 1
         self.bytes_total += simple_packet.size
@@ -431,11 +418,11 @@ class Conversation:
             if self.application is None:
                 self.application = simple_packet.application
             elif self.application != simple_packet.application:
-                self._log.warning(f'Expected application {self.application}'
-                    f' but got {simple_packet.application}')
+                _log.warning(f'Expected application {self.application}'
+                             f' but got {simple_packet.application}')
             return True
         except Exception as err:
-            self._log.exception(err)
+            _log.exception(err)
             raise err
         
     @staticmethod
@@ -546,17 +533,14 @@ class PacketStatistics:
 
     """
     def __init__(self,
-                 log: Logger = None,
                  source_filename: str = None,
                  ) -> None:
         """Creates a PacketStatistics object.
         
         Args:
-            log: An optional logging facility
             source_filename: An optional tie to the source pcap file
 
         """
-        self._log = log or get_wrapping_logger()
         self._source_filename: str = source_filename
         self.conversations: list[Conversation] = []
         self._packet_count: int = 0
@@ -614,9 +598,9 @@ class PacketStatistics:
     def _process_arp(self, packet: SharkPacket):
         arp_desc = f'{packet.arp.src_proto_ipv4}-->{packet.arp.dst_proto_ipv4}'
         if not _is_local_traffic(packet):
-            self._log.warning(f'Non-local ARP packet {arp_desc}')
+            _log.warning(f'Non-local ARP packet {arp_desc}')
         else:
-            self._log.debug(f'Local ARP {arp_desc} (ignored from statistics)')
+            _log.debug(f'Local ARP {arp_desc} (ignored from statistics)')
 
     def _process_ip(self, packet: SharkPacket):
         in_conversation = False
@@ -630,8 +614,8 @@ class PacketStatistics:
                 in_conversation = True
                 break
         if not in_conversation:
-            self._log.debug('Found new conversation')
-            conversation = Conversation(packet, self._log)
+            _log.debug('Found new conversation')
+            conversation = Conversation(packet)
             self.conversations.append(conversation)
 
     def _process_unhandled(self, packet: SharkPacket):
@@ -639,7 +623,7 @@ class PacketStatistics:
         self._unhandled_packet_count += 1
         self._unhandled_bytes += int(packet.length)
         if packet_type not in self._unhandled_packet_types:
-            self._log.warning(f'Unhandled packet type {packet_type}')
+            _log.warning(f'Unhandled packet type {packet_type}')
             self._unhandled_packet_types.append(packet_type)
 
     def data_series_application_size(self) -> dict:
@@ -732,17 +716,17 @@ class PacketStatistics:
 
 
 def _get_event_loop() -> tuple:
-    newloop = False
+    loop_is_new = False
     try:
-        loop = asyncio.get_running_loop()
+        loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
     except RuntimeError as err:
         if 'no running event loop' not in f'{err}':
             raise err
         loop = asyncio.new_event_loop()
-        newloop = True
+        loop_is_new = True
     asyncio.set_event_loop(loop)
     asyncio.get_child_watcher().attach_loop(loop)
-    return loop, newloop
+    return loop, loop_is_new
 
 
 def process_pcap(filename: str,
@@ -786,35 +770,36 @@ def process_pcap(filename: str,
         A PacketStatistics object with data and analytics functions.
 
     """
-    log = get_wrapping_logger()
-    packet_stats = PacketStatistics(log=log, source_filename=filename)
-    file = clean_path(filename)
-    loop = None
-    newloop = False
+    packet_stats = PacketStatistics(source_filename=filename)
+    file = _clean_path(filename)
+    loop: asyncio.AbstractEventLoop = None
+    loop_is_new = False
     if queue is not None:
-        loop, newloop = _get_event_loop()
+        loop, loop_is_new = _get_event_loop()
     capture = pyshark.FileCapture(input_file=file,
-        display_filter=display_filter, eventloop=loop)
+                                  display_filter=display_filter,
+                                  eventloop=loop)
     capture.set_debug(debug)
     packet_number = 0
     for packet in capture:
         packet_number += 1
-        if packet_number == 15:
-            log.info('Problem packet...')
+        # DEV: Uncomment below for specific step-through troubleshooting
+        # if packet_number == 15:
+        #     _log.info('Problem packet...')
         try:
             packet_stats.packet_add(packet)
         except NotImplementedError as err:
-            log.error(f'pyshark: {err}')
+            _log.error(f'pyshark: {err}')
         except TSharkCrashException as err:
-            log.error(f'tshark: {err}')
+            _log.error(f'tshark: {err}')
             break
         except Exception:
             #TODO: better error capture e.g. appears to have been cut short use editcap
             # https://tshark.dev/share/pcap_preparation/
-            log.exception(f'Packet {packet_number} processing ERROR')
+            _log.exception(f'Packet {packet_number} processing ERROR')
             break
     capture.close()
-    if newloop:
+    if loop_is_new:
         loop.close()
     if queue is not None:
         queue.put(packet_stats)
@@ -822,7 +807,7 @@ def process_pcap(filename: str,
         return packet_stats
 
 
-def pcap_filename(duration: int) -> str:
+def pcap_filename(duration: int, interface: str = '') -> str:
     """Generates a pcap filename using datetime of the capture start.
     
     The datetime is UTC, and the duration is in seconds.
@@ -832,8 +817,8 @@ def pcap_filename(duration: int) -> str:
 
     """
     dt = datetime.utcnow().isoformat().replace('-', '').replace(':', '')[0:15]
-    filename = f'capture_{dt}_{duration}.pcap'
-    return filename
+    filename = f'capture_{dt}_{duration}' + f'_{interface}' if interface else ''
+    return f'{filename}.pcap'
 
 
 def create_pcap(interface: str = 'eth1',
@@ -842,7 +827,6 @@ def create_pcap(interface: str = 'eth1',
                 target_directory: str = '$HOME',
                 queue: Queue = None,
                 debug: bool = False,
-                log: Logger = None,
                 ) -> str:
     """Creates a packet capture file of a specified interface.
 
@@ -887,24 +871,24 @@ def create_pcap(interface: str = 'eth1',
         The full file/path name if no event is passed in.
 
     """
-    log = log or get_wrapping_logger()
     if filename is None:
         filename = pcap_filename(duration)
-    target_directory = clean_path(target_directory)
+    target_directory = _clean_path(target_directory)
     subdir = f'{target_directory}/{filename[0:len("capture_YYYYmmdd")]}'
     filepath = f'{subdir}/{filename}'
     if not os.path.isdir(subdir):
         os.makedirs(subdir)
-    loop = None
-    newloop = False
+    loop: asyncio.AbstractEventLoop = None
+    loop_is_new = False
     if queue is not None:
-        loop, newloop = _get_event_loop()
-    capture = pyshark.LiveCapture(interface=interface, output_file=filepath,
-        eventloop=loop)
+        loop, loop_is_new = _get_event_loop()
+    capture = pyshark.LiveCapture(interface=interface,
+                                  output_file=filepath,
+                                  eventloop=loop)
     capture.set_debug(debug)
     capture.sniff(timeout=duration)
     capture.close()
-    if newloop:
+    if loop_is_new:
         loop.close()
     if queue is not None:
         queue.put(filepath)

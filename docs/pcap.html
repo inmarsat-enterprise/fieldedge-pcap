@@ -52,22 +52,21 @@ report by exception be used with a less frequent update pushed?
 &#34;&#34;&#34;
 import asyncio
 import json
+import logging
 import os
 import statistics
-from logging import Logger
-from multiprocessing import Queue
 from datetime import datetime
 from enum import Enum
+from multiprocessing import Queue
+from pathlib import Path
 
 import pyshark
-from pyshark.packet.packet import Packet as SharkPacket
 from pyshark.capture.capture import TSharkCrashException
+from pyshark.packet.packet import Packet as SharkPacket
 
-from fieldedge_utilities.logger import get_wrapping_logger
-from fieldedge_utilities.path import clean_path
+_log = logging.getLogger(__name__)
 
 
-# Ethernet packet types
 class EthernetProtocol(Enum):
     &#34;&#34;&#34;Mappings for Ethernet packet types.&#34;&#34;&#34;
     ETH_TYPE_EDP = 0x00bb  # Extreme Networks Discovery Protocol
@@ -92,9 +91,9 @@ class EthernetProtocol(Enum):
     ETH_TYPE_LLDP = 0x88CC  # Link Layer Discovery Protocol
     ETH_TYPE_TEB = 0x6558  # Transparent Ethernet Bridging
 
-# Common/registered IP protocol ports
+
 class KnownTcpPorts(Enum):
-    &#34;&#34;&#34;Mappings for application layer ports.&#34;&#34;&#34;
+    &#34;&#34;&#34;Mappings for common registered/known application layer TCP ports.&#34;&#34;&#34;
     SMTP = 25
     HTTP = 80
     HTTPS = 443
@@ -120,44 +119,14 @@ class KnownTcpPorts(Enum):
     DNP = 20000
     IEC60870 = 2404
 
+
 class KnownUdpPorts(Enum):
+    &#34;&#34;&#34;Mappings for common registered/known application layer TCP ports.&#34;&#34;&#34;
     SNMP = 161
     DNS = 53
     DHCP_QUERY = 67
     DHCP_RESPONSE = 68
     NTP = 123
-
-
-class ApplicationPort(Enum):
-    &#34;&#34;&#34;Mappings for application layer ports.&#34;&#34;&#34;
-    TCP_SMTP = 25
-    TCP_HTTP = 80
-    TCP_HTTPS = 443
-    TCP_DNS = 53
-    TCP_FTP = 20
-    TCP_FTPC = 21
-    TCP_TELNET = 23
-    TCP_IMAP = 143
-    TCP_RDP = 3389
-    TCP_SSH = 22
-    TCP_HTTP2 = 8080
-    TCP_MODBUS = 502
-    TCP_MODBUSS = 802
-    TCP_MQTT = 1883
-    TCP_MQTTS = 8883
-    TCP_DOCKERAPI = 2375
-    TCP_DOCKERAPIS = 2376
-    TCP_SRCP = 4303
-    TCP_COAP = 5683
-    TCP_COAPS = 5684
-    TCP_DNP2 = 19999
-    TCP_DNP = 20000
-    TCP_IEC60870 = 2404
-    UDP_SNMP = 161
-    UDP_DNS = 53
-    UDP_DHCPQ = 67
-    UDP_DHCPR = 68
-    UDP_NTP = 123
 
 
 def _get_src_dst(packet: SharkPacket) -&gt; tuple:
@@ -199,7 +168,7 @@ def _get_ports(packet: SharkPacket) -&gt; tuple:
     return (srcport, dstport)
 
 
-def _get_application(packet: SharkPacket, log: Logger = None) -&gt; str:
+def _get_application(packet: SharkPacket) -&gt; str:
     &#34;&#34;&#34;Returns the application layer descriptor.
     
     If the port is a registered port it will return a caps string.
@@ -210,8 +179,6 @@ def _get_application(packet: SharkPacket, log: Logger = None) -&gt; str:
     Returns:
         A string with the application layer protocol e.g. `TCP_MQTTS`
     &#34;&#34;&#34;
-    if not log:
-        log = get_wrapping_logger()
     application = None
     if hasattr(packet[packet.highest_layer], &#39;app_data_proto&#39;):
         application = str(packet[packet.highest_layer].app_data_proto).upper()
@@ -241,7 +208,7 @@ def _get_application(packet: SharkPacket, log: Logger = None) -&gt; str:
             highest_layer = str(packet.highest_layer).upper()
             application = f&#39;{transport_layer}_{highest_layer}&#39;
         except Exception as err:
-            log.error(err)
+            _log.error(err)
             application = f&#39;{str(packet.highest_layer).upper()}&#39;
     # identified workarounds for observed pyshark/tshark app_data_proto
     if not application:
@@ -313,6 +280,25 @@ def _is_local_traffic(packet: SharkPacket) -&gt; bool:
     return False
 
 
+def _clean_path(pathname: str) -&gt; str:
+    &#34;&#34;&#34;Adjusts relative and shorthand filenames for OS independence.
+    
+    Args:
+        pathname: The full path/to/file
+    
+    Returns:
+        A clean file/path name for the current OS and directory structure.
+    &#34;&#34;&#34;
+    if pathname.startswith(&#39;$HOME/&#39;):
+        pathname = pathname.replace(&#39;$HOME&#39;, str(Path.home()), 1)
+    elif pathname.startswith(&#39;~/&#39;):
+        pathname = pathname.replace(&#39;~&#39;, str(Path.home()), 1)
+    if os.path.isdir(os.path.dirname(pathname)):
+        return os.path.realpath(pathname)
+    else:
+        raise ValueError(f&#39;Directory {os.path.dirname(pathname)} not found&#39;)
+
+
 class SimplePacket:
     &#34;&#34;&#34;A simplified packet representation.
     
@@ -366,8 +352,7 @@ class Conversation:
         bytes_total: The total number of bytes in the conversation
 
     &#34;&#34;&#34;
-    def __init__(self, packet: SharkPacket = None, log: Logger = None):
-        self._log = log or get_wrapping_logger()
+    def __init__(self, packet: SharkPacket = None):
         self.application: str = None
         self.hosts: tuple = None
         self.a_b: int = 0
@@ -405,7 +390,7 @@ class Conversation:
             try:
                 stream_id = packet[transport].stream
             except AttributeError as err:
-                self._log.exception(f&#39;{err}&#39;)
+                _log.exception(f&#39;{err}&#39;)
         elif hasattr(packet, &#39;icmp&#39;) and packet[&#39;icmp&#39;].udp_stream:
             stream_id = packet[&#39;icmp&#39;].udp_stream
         if (src in self.hosts and dst in self.hosts and
@@ -437,12 +422,14 @@ class Conversation:
         try:
             simple_packet = SimplePacket(packet, self.hosts)
         except Exception as err:
-            self._log.error(err)
+            _log.error(err)
             raise err
         isotime = datetime.utcfromtimestamp(simple_packet.timestamp).isoformat()[0:23]
-        self._log.debug(f&#39;{isotime}|{simple_packet.application}|&#39;
-            f&#39;({simple_packet.transport}.{simple_packet.stream_id}:{simple_packet.dstport})&#39;
-            f&#39;|{simple_packet.size} bytes|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
+        _log.debug(f&#39;{isotime}|{simple_packet.application}|&#39;
+                   f&#39;({simple_packet.transport}.{simple_packet.stream_id}&#39;
+                   f&#39;:{simple_packet.dstport})&#39;
+                   f&#39;|{simple_packet.size} bytes&#39;
+                   f&#39;|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
         if simple_packet.src == self.hosts[0]:
             self.a_b += 1
         else:
@@ -458,7 +445,7 @@ class Conversation:
         elif simple_packet.stream_id != self.stream_id:
             err = (f&#39;Expected stream {self.stream_id}&#39;
                    f&#39; but got {simple_packet.stream_id}&#39;)
-            # self._log.error(err)
+            _log.error(err)
             raise ValueError(err)
         self.packet_count += 1
         self.bytes_total += simple_packet.size
@@ -470,11 +457,11 @@ class Conversation:
             if self.application is None:
                 self.application = simple_packet.application
             elif self.application != simple_packet.application:
-                self._log.warning(f&#39;Expected application {self.application}&#39;
-                    f&#39; but got {simple_packet.application}&#39;)
+                _log.warning(f&#39;Expected application {self.application}&#39;
+                             f&#39; but got {simple_packet.application}&#39;)
             return True
         except Exception as err:
-            self._log.exception(err)
+            _log.exception(err)
             raise err
         
     @staticmethod
@@ -585,17 +572,14 @@ class PacketStatistics:
 
     &#34;&#34;&#34;
     def __init__(self,
-                 log: Logger = None,
                  source_filename: str = None,
                  ) -&gt; None:
         &#34;&#34;&#34;Creates a PacketStatistics object.
         
         Args:
-            log: An optional logging facility
             source_filename: An optional tie to the source pcap file
 
         &#34;&#34;&#34;
-        self._log = log or get_wrapping_logger()
         self._source_filename: str = source_filename
         self.conversations: list[Conversation] = []
         self._packet_count: int = 0
@@ -653,9 +637,9 @@ class PacketStatistics:
     def _process_arp(self, packet: SharkPacket):
         arp_desc = f&#39;{packet.arp.src_proto_ipv4}--&gt;{packet.arp.dst_proto_ipv4}&#39;
         if not _is_local_traffic(packet):
-            self._log.warning(f&#39;Non-local ARP packet {arp_desc}&#39;)
+            _log.warning(f&#39;Non-local ARP packet {arp_desc}&#39;)
         else:
-            self._log.debug(f&#39;Local ARP {arp_desc} (ignored from statistics)&#39;)
+            _log.debug(f&#39;Local ARP {arp_desc} (ignored from statistics)&#39;)
 
     def _process_ip(self, packet: SharkPacket):
         in_conversation = False
@@ -669,8 +653,8 @@ class PacketStatistics:
                 in_conversation = True
                 break
         if not in_conversation:
-            self._log.debug(&#39;Found new conversation&#39;)
-            conversation = Conversation(packet, self._log)
+            _log.debug(&#39;Found new conversation&#39;)
+            conversation = Conversation(packet)
             self.conversations.append(conversation)
 
     def _process_unhandled(self, packet: SharkPacket):
@@ -678,7 +662,7 @@ class PacketStatistics:
         self._unhandled_packet_count += 1
         self._unhandled_bytes += int(packet.length)
         if packet_type not in self._unhandled_packet_types:
-            self._log.warning(f&#39;Unhandled packet type {packet_type}&#39;)
+            _log.warning(f&#39;Unhandled packet type {packet_type}&#39;)
             self._unhandled_packet_types.append(packet_type)
 
     def data_series_application_size(self) -&gt; dict:
@@ -771,17 +755,17 @@ class PacketStatistics:
 
 
 def _get_event_loop() -&gt; tuple:
-    newloop = False
+    loop_is_new = False
     try:
-        loop = asyncio.get_running_loop()
+        loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
     except RuntimeError as err:
         if &#39;no running event loop&#39; not in f&#39;{err}&#39;:
             raise err
         loop = asyncio.new_event_loop()
-        newloop = True
+        loop_is_new = True
     asyncio.set_event_loop(loop)
     asyncio.get_child_watcher().attach_loop(loop)
-    return loop, newloop
+    return loop, loop_is_new
 
 
 def process_pcap(filename: str,
@@ -825,35 +809,36 @@ def process_pcap(filename: str,
         A PacketStatistics object with data and analytics functions.
 
     &#34;&#34;&#34;
-    log = get_wrapping_logger()
-    packet_stats = PacketStatistics(log=log, source_filename=filename)
-    file = clean_path(filename)
-    loop = None
-    newloop = False
+    packet_stats = PacketStatistics(source_filename=filename)
+    file = _clean_path(filename)
+    loop: asyncio.AbstractEventLoop = None
+    loop_is_new = False
     if queue is not None:
-        loop, newloop = _get_event_loop()
+        loop, loop_is_new = _get_event_loop()
     capture = pyshark.FileCapture(input_file=file,
-        display_filter=display_filter, eventloop=loop)
+                                  display_filter=display_filter,
+                                  eventloop=loop)
     capture.set_debug(debug)
     packet_number = 0
     for packet in capture:
         packet_number += 1
-        if packet_number == 15:
-            log.info(&#39;Problem packet...&#39;)
+        # DEV: Uncomment below for specific step-through troubleshooting
+        # if packet_number == 15:
+        #     _log.info(&#39;Problem packet...&#39;)
         try:
             packet_stats.packet_add(packet)
         except NotImplementedError as err:
-            log.error(f&#39;pyshark: {err}&#39;)
+            _log.error(f&#39;pyshark: {err}&#39;)
         except TSharkCrashException as err:
-            log.error(f&#39;tshark: {err}&#39;)
+            _log.error(f&#39;tshark: {err}&#39;)
             break
         except Exception:
             #TODO: better error capture e.g. appears to have been cut short use editcap
             # https://tshark.dev/share/pcap_preparation/
-            log.exception(f&#39;Packet {packet_number} processing ERROR&#39;)
+            _log.exception(f&#39;Packet {packet_number} processing ERROR&#39;)
             break
     capture.close()
-    if newloop:
+    if loop_is_new:
         loop.close()
     if queue is not None:
         queue.put(packet_stats)
@@ -861,7 +846,7 @@ def process_pcap(filename: str,
         return packet_stats
 
 
-def pcap_filename(duration: int) -&gt; str:
+def pcap_filename(duration: int, interface: str = &#39;&#39;) -&gt; str:
     &#34;&#34;&#34;Generates a pcap filename using datetime of the capture start.
     
     The datetime is UTC, and the duration is in seconds.
@@ -871,8 +856,8 @@ def pcap_filename(duration: int) -&gt; str:
 
     &#34;&#34;&#34;
     dt = datetime.utcnow().isoformat().replace(&#39;-&#39;, &#39;&#39;).replace(&#39;:&#39;, &#39;&#39;)[0:15]
-    filename = f&#39;capture_{dt}_{duration}.pcap&#39;
-    return filename
+    filename = f&#39;capture_{dt}_{duration}&#39; + f&#39;_{interface}&#39; if interface else &#39;&#39;
+    return f&#39;{filename}.pcap&#39;
 
 
 def create_pcap(interface: str = &#39;eth1&#39;,
@@ -881,7 +866,6 @@ def create_pcap(interface: str = &#39;eth1&#39;,
                 target_directory: str = &#39;$HOME&#39;,
                 queue: Queue = None,
                 debug: bool = False,
-                log: Logger = None,
                 ) -&gt; str:
     &#34;&#34;&#34;Creates a packet capture file of a specified interface.
 
@@ -926,24 +910,24 @@ def create_pcap(interface: str = &#39;eth1&#39;,
         The full file/path name if no event is passed in.
 
     &#34;&#34;&#34;
-    log = log or get_wrapping_logger()
     if filename is None:
         filename = pcap_filename(duration)
-    target_directory = clean_path(target_directory)
+    target_directory = _clean_path(target_directory)
     subdir = f&#39;{target_directory}/{filename[0:len(&#34;capture_YYYYmmdd&#34;)]}&#39;
     filepath = f&#39;{subdir}/{filename}&#39;
     if not os.path.isdir(subdir):
         os.makedirs(subdir)
-    loop = None
-    newloop = False
+    loop: asyncio.AbstractEventLoop = None
+    loop_is_new = False
     if queue is not None:
-        loop, newloop = _get_event_loop()
-    capture = pyshark.LiveCapture(interface=interface, output_file=filepath,
-        eventloop=loop)
+        loop, loop_is_new = _get_event_loop()
+    capture = pyshark.LiveCapture(interface=interface,
+                                  output_file=filepath,
+                                  eventloop=loop)
     capture.set_debug(debug)
     capture.sniff(timeout=duration)
     capture.close()
-    if newloop:
+    if loop_is_new:
         loop.close()
     if queue is not None:
         queue.put(filepath)
@@ -959,7 +943,7 @@ def create_pcap(interface: str = &#39;eth1&#39;,
 <h2 class="section-title" id="header-functions">Functions</h2>
 <dl>
 <dt id="fieldedge_pcap.pcap.create_pcap"><code class="name flex">
-<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10e176da0>> = None, debug: bool = False, log: logging.Logger = None) ‑> str</span>
+<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10eca2b38>> = None, debug: bool = False) ‑> str</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Creates a packet capture file of a specified interface.</p>
@@ -1014,7 +998,6 @@ should have a returncode 0.</p>
                 target_directory: str = &#39;$HOME&#39;,
                 queue: Queue = None,
                 debug: bool = False,
-                log: Logger = None,
                 ) -&gt; str:
     &#34;&#34;&#34;Creates a packet capture file of a specified interface.
 
@@ -1059,24 +1042,24 @@ should have a returncode 0.</p>
         The full file/path name if no event is passed in.
 
     &#34;&#34;&#34;
-    log = log or get_wrapping_logger()
     if filename is None:
         filename = pcap_filename(duration)
-    target_directory = clean_path(target_directory)
+    target_directory = _clean_path(target_directory)
     subdir = f&#39;{target_directory}/{filename[0:len(&#34;capture_YYYYmmdd&#34;)]}&#39;
     filepath = f&#39;{subdir}/{filename}&#39;
     if not os.path.isdir(subdir):
         os.makedirs(subdir)
-    loop = None
-    newloop = False
+    loop: asyncio.AbstractEventLoop = None
+    loop_is_new = False
     if queue is not None:
-        loop, newloop = _get_event_loop()
-    capture = pyshark.LiveCapture(interface=interface, output_file=filepath,
-        eventloop=loop)
+        loop, loop_is_new = _get_event_loop()
+    capture = pyshark.LiveCapture(interface=interface,
+                                  output_file=filepath,
+                                  eventloop=loop)
     capture.set_debug(debug)
     capture.sniff(timeout=duration)
     capture.close()
-    if newloop:
+    if loop_is_new:
         loop.close()
     if queue is not None:
         queue.put(filepath)
@@ -1158,7 +1141,7 @@ should have a returncode 0.</p>
 </details>
 </dd>
 <dt id="fieldedge_pcap.pcap.pcap_filename"><code class="name flex">
-<span>def <span class="ident">pcap_filename</span></span>(<span>duration: int) ‑> str</span>
+<span>def <span class="ident">pcap_filename</span></span>(<span>duration: int, interface: str = '') ‑> str</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Generates a pcap filename using datetime of the capture start.</p>
@@ -1169,7 +1152,7 @@ should have a returncode 0.</p>
 <summary>
 <span>Expand source code</span>
 </summary>
-<pre><code class="python">def pcap_filename(duration: int) -&gt; str:
+<pre><code class="python">def pcap_filename(duration: int, interface: str = &#39;&#39;) -&gt; str:
     &#34;&#34;&#34;Generates a pcap filename using datetime of the capture start.
     
     The datetime is UTC, and the duration is in seconds.
@@ -1179,12 +1162,12 @@ should have a returncode 0.</p>
 
     &#34;&#34;&#34;
     dt = datetime.utcnow().isoformat().replace(&#39;-&#39;, &#39;&#39;).replace(&#39;:&#39;, &#39;&#39;)[0:15]
-    filename = f&#39;capture_{dt}_{duration}.pcap&#39;
-    return filename</code></pre>
+    filename = f&#39;capture_{dt}_{duration}&#39; + f&#39;_{interface}&#39; if interface else &#39;&#39;
+    return f&#39;{filename}.pcap&#39;</code></pre>
 </details>
 </dd>
 <dt id="fieldedge_pcap.pcap.process_pcap"><code class="name flex">
-<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10e176da0>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
+<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10eca2b38>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
 </code></dt>
 <dd>
 <div class="desc"><p>Processes a PCAP file to create metrics for conversations.</p>
@@ -1268,35 +1251,36 @@ process.join()
         A PacketStatistics object with data and analytics functions.
 
     &#34;&#34;&#34;
-    log = get_wrapping_logger()
-    packet_stats = PacketStatistics(log=log, source_filename=filename)
-    file = clean_path(filename)
-    loop = None
-    newloop = False
+    packet_stats = PacketStatistics(source_filename=filename)
+    file = _clean_path(filename)
+    loop: asyncio.AbstractEventLoop = None
+    loop_is_new = False
     if queue is not None:
-        loop, newloop = _get_event_loop()
+        loop, loop_is_new = _get_event_loop()
     capture = pyshark.FileCapture(input_file=file,
-        display_filter=display_filter, eventloop=loop)
+                                  display_filter=display_filter,
+                                  eventloop=loop)
     capture.set_debug(debug)
     packet_number = 0
     for packet in capture:
         packet_number += 1
-        if packet_number == 15:
-            log.info(&#39;Problem packet...&#39;)
+        # DEV: Uncomment below for specific step-through troubleshooting
+        # if packet_number == 15:
+        #     _log.info(&#39;Problem packet...&#39;)
         try:
             packet_stats.packet_add(packet)
         except NotImplementedError as err:
-            log.error(f&#39;pyshark: {err}&#39;)
+            _log.error(f&#39;pyshark: {err}&#39;)
         except TSharkCrashException as err:
-            log.error(f&#39;tshark: {err}&#39;)
+            _log.error(f&#39;tshark: {err}&#39;)
             break
         except Exception:
             #TODO: better error capture e.g. appears to have been cut short use editcap
             # https://tshark.dev/share/pcap_preparation/
-            log.exception(f&#39;Packet {packet_number} processing ERROR&#39;)
+            _log.exception(f&#39;Packet {packet_number} processing ERROR&#39;)
             break
     capture.close()
-    if newloop:
+    if loop_is_new:
         loop.close()
     if queue is not None:
         queue.put(packet_stats)
@@ -1309,170 +1293,9 @@ process.join()
 <section>
 <h2 class="section-title" id="header-classes">Classes</h2>
 <dl>
-<dt id="fieldedge_pcap.pcap.ApplicationPort"><code class="flex name class">
-<span>class <span class="ident">ApplicationPort</span></span>
-<span>(</span><span>value, names=None, *, module=None, qualname=None, type=None, start=1)</span>
-</code></dt>
-<dd>
-<div class="desc"><p>Mappings for application layer ports.</p></div>
-<details class="source">
-<summary>
-<span>Expand source code</span>
-</summary>
-<pre><code class="python">class ApplicationPort(Enum):
-    &#34;&#34;&#34;Mappings for application layer ports.&#34;&#34;&#34;
-    TCP_SMTP = 25
-    TCP_HTTP = 80
-    TCP_HTTPS = 443
-    TCP_DNS = 53
-    TCP_FTP = 20
-    TCP_FTPC = 21
-    TCP_TELNET = 23
-    TCP_IMAP = 143
-    TCP_RDP = 3389
-    TCP_SSH = 22
-    TCP_HTTP2 = 8080
-    TCP_MODBUS = 502
-    TCP_MODBUSS = 802
-    TCP_MQTT = 1883
-    TCP_MQTTS = 8883
-    TCP_DOCKERAPI = 2375
-    TCP_DOCKERAPIS = 2376
-    TCP_SRCP = 4303
-    TCP_COAP = 5683
-    TCP_COAPS = 5684
-    TCP_DNP2 = 19999
-    TCP_DNP = 20000
-    TCP_IEC60870 = 2404
-    UDP_SNMP = 161
-    UDP_DNS = 53
-    UDP_DHCPQ = 67
-    UDP_DHCPR = 68
-    UDP_NTP = 123</code></pre>
-</details>
-<h3>Ancestors</h3>
-<ul class="hlist">
-<li>enum.Enum</li>
-</ul>
-<h3>Class variables</h3>
-<dl>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_COAP"><code class="name">var <span class="ident">TCP_COAP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_COAPS"><code class="name">var <span class="ident">TCP_COAPS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_DNP"><code class="name">var <span class="ident">TCP_DNP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_DNP2"><code class="name">var <span class="ident">TCP_DNP2</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_DNS"><code class="name">var <span class="ident">TCP_DNS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_DOCKERAPI"><code class="name">var <span class="ident">TCP_DOCKERAPI</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_DOCKERAPIS"><code class="name">var <span class="ident">TCP_DOCKERAPIS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_FTP"><code class="name">var <span class="ident">TCP_FTP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_FTPC"><code class="name">var <span class="ident">TCP_FTPC</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_HTTP"><code class="name">var <span class="ident">TCP_HTTP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_HTTP2"><code class="name">var <span class="ident">TCP_HTTP2</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_HTTPS"><code class="name">var <span class="ident">TCP_HTTPS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_IEC60870"><code class="name">var <span class="ident">TCP_IEC60870</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_IMAP"><code class="name">var <span class="ident">TCP_IMAP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_MODBUS"><code class="name">var <span class="ident">TCP_MODBUS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_MODBUSS"><code class="name">var <span class="ident">TCP_MODBUSS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_MQTT"><code class="name">var <span class="ident">TCP_MQTT</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_MQTTS"><code class="name">var <span class="ident">TCP_MQTTS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_RDP"><code class="name">var <span class="ident">TCP_RDP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_SMTP"><code class="name">var <span class="ident">TCP_SMTP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_SRCP"><code class="name">var <span class="ident">TCP_SRCP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_SSH"><code class="name">var <span class="ident">TCP_SSH</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.TCP_TELNET"><code class="name">var <span class="ident">TCP_TELNET</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.UDP_DHCPQ"><code class="name">var <span class="ident">UDP_DHCPQ</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.UDP_DHCPR"><code class="name">var <span class="ident">UDP_DHCPR</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.UDP_DNS"><code class="name">var <span class="ident">UDP_DNS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.UDP_NTP"><code class="name">var <span class="ident">UDP_NTP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.ApplicationPort.UDP_SNMP"><code class="name">var <span class="ident">UDP_SNMP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-</dl>
-</dd>
 <dt id="fieldedge_pcap.pcap.Conversation"><code class="flex name class">
 <span>class <span class="ident">Conversation</span></span>
-<span>(</span><span>packet: pyshark.packet.packet.Packet = None, log: logging.Logger = None)</span>
+<span>(</span><span>packet: pyshark.packet.packet.Packet = None)</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Encapsulates all traffic between two endpoints.</p>
@@ -1519,8 +1342,7 @@ process.join()
         bytes_total: The total number of bytes in the conversation
 
     &#34;&#34;&#34;
-    def __init__(self, packet: SharkPacket = None, log: Logger = None):
-        self._log = log or get_wrapping_logger()
+    def __init__(self, packet: SharkPacket = None):
         self.application: str = None
         self.hosts: tuple = None
         self.a_b: int = 0
@@ -1558,7 +1380,7 @@ process.join()
             try:
                 stream_id = packet[transport].stream
             except AttributeError as err:
-                self._log.exception(f&#39;{err}&#39;)
+                _log.exception(f&#39;{err}&#39;)
         elif hasattr(packet, &#39;icmp&#39;) and packet[&#39;icmp&#39;].udp_stream:
             stream_id = packet[&#39;icmp&#39;].udp_stream
         if (src in self.hosts and dst in self.hosts and
@@ -1590,12 +1412,14 @@ process.join()
         try:
             simple_packet = SimplePacket(packet, self.hosts)
         except Exception as err:
-            self._log.error(err)
+            _log.error(err)
             raise err
         isotime = datetime.utcfromtimestamp(simple_packet.timestamp).isoformat()[0:23]
-        self._log.debug(f&#39;{isotime}|{simple_packet.application}|&#39;
-            f&#39;({simple_packet.transport}.{simple_packet.stream_id}:{simple_packet.dstport})&#39;
-            f&#39;|{simple_packet.size} bytes|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
+        _log.debug(f&#39;{isotime}|{simple_packet.application}|&#39;
+                   f&#39;({simple_packet.transport}.{simple_packet.stream_id}&#39;
+                   f&#39;:{simple_packet.dstport})&#39;
+                   f&#39;|{simple_packet.size} bytes&#39;
+                   f&#39;|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
         if simple_packet.src == self.hosts[0]:
             self.a_b += 1
         else:
@@ -1611,7 +1435,7 @@ process.join()
         elif simple_packet.stream_id != self.stream_id:
             err = (f&#39;Expected stream {self.stream_id}&#39;
                    f&#39; but got {simple_packet.stream_id}&#39;)
-            # self._log.error(err)
+            _log.error(err)
             raise ValueError(err)
         self.packet_count += 1
         self.bytes_total += simple_packet.size
@@ -1623,11 +1447,11 @@ process.join()
             if self.application is None:
                 self.application = simple_packet.application
             elif self.application != simple_packet.application:
-                self._log.warning(f&#39;Expected application {self.application}&#39;
-                    f&#39; but got {simple_packet.application}&#39;)
+                _log.warning(f&#39;Expected application {self.application}&#39;
+                             f&#39; but got {simple_packet.application}&#39;)
             return True
         except Exception as err:
-            self._log.exception(err)
+            _log.exception(err)
             raise err
         
     @staticmethod
@@ -1871,7 +1695,7 @@ average repeat interval B to A in seconds</p></div>
         try:
             stream_id = packet[transport].stream
         except AttributeError as err:
-            self._log.exception(f&#39;{err}&#39;)
+            _log.exception(f&#39;{err}&#39;)
     elif hasattr(packet, &#39;icmp&#39;) and packet[&#39;icmp&#39;].udp_stream:
         stream_id = packet[&#39;icmp&#39;].udp_stream
     if (src in self.hosts and dst in self.hosts and
@@ -1923,12 +1747,14 @@ different transport or stream ID than the conversation.</p></div>
     try:
         simple_packet = SimplePacket(packet, self.hosts)
     except Exception as err:
-        self._log.error(err)
+        _log.error(err)
         raise err
     isotime = datetime.utcfromtimestamp(simple_packet.timestamp).isoformat()[0:23]
-    self._log.debug(f&#39;{isotime}|{simple_packet.application}|&#39;
-        f&#39;({simple_packet.transport}.{simple_packet.stream_id}:{simple_packet.dstport})&#39;
-        f&#39;|{simple_packet.size} bytes|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
+    _log.debug(f&#39;{isotime}|{simple_packet.application}|&#39;
+               f&#39;({simple_packet.transport}.{simple_packet.stream_id}&#39;
+               f&#39;:{simple_packet.dstport})&#39;
+               f&#39;|{simple_packet.size} bytes&#39;
+               f&#39;|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
     if simple_packet.src == self.hosts[0]:
         self.a_b += 1
     else:
@@ -1944,7 +1770,7 @@ different transport or stream ID than the conversation.</p></div>
     elif simple_packet.stream_id != self.stream_id:
         err = (f&#39;Expected stream {self.stream_id}&#39;
                f&#39; but got {simple_packet.stream_id}&#39;)
-        # self._log.error(err)
+        _log.error(err)
         raise ValueError(err)
     self.packet_count += 1
     self.bytes_total += simple_packet.size
@@ -1956,11 +1782,11 @@ different transport or stream ID than the conversation.</p></div>
         if self.application is None:
             self.application = simple_packet.application
         elif self.application != simple_packet.application:
-            self._log.warning(f&#39;Expected application {self.application}&#39;
-                f&#39; but got {simple_packet.application}&#39;)
+            _log.warning(f&#39;Expected application {self.application}&#39;
+                         f&#39; but got {simple_packet.application}&#39;)
         return True
     except Exception as err:
-        self._log.exception(err)
+        _log.exception(err)
         raise err</code></pre>
 </details>
 </dd>
@@ -2097,13 +1923,13 @@ different transport or stream ID than the conversation.</p></div>
 <span>(</span><span>value, names=None, *, module=None, qualname=None, type=None, start=1)</span>
 </code></dt>
 <dd>
-<div class="desc"><p>Mappings for application layer ports.</p></div>
+<div class="desc"><p>Mappings for common registered/known application layer TCP ports.</p></div>
 <details class="source">
 <summary>
 <span>Expand source code</span>
 </summary>
 <pre><code class="python">class KnownTcpPorts(Enum):
-    &#34;&#34;&#34;Mappings for application layer ports.&#34;&#34;&#34;
+    &#34;&#34;&#34;Mappings for common registered/known application layer TCP ports.&#34;&#34;&#34;
     SMTP = 25
     HTTP = 80
     HTTPS = 443
@@ -2238,12 +2064,13 @@ different transport or stream ID than the conversation.</p></div>
 <span>(</span><span>value, names=None, *, module=None, qualname=None, type=None, start=1)</span>
 </code></dt>
 <dd>
-<div class="desc"><p>An enumeration.</p></div>
+<div class="desc"><p>Mappings for common registered/known application layer TCP ports.</p></div>
 <details class="source">
 <summary>
 <span>Expand source code</span>
 </summary>
 <pre><code class="python">class KnownUdpPorts(Enum):
+    &#34;&#34;&#34;Mappings for common registered/known application layer TCP ports.&#34;&#34;&#34;
     SNMP = 161
     DNS = 53
     DHCP_QUERY = 67
@@ -2280,7 +2107,7 @@ different transport or stream ID than the conversation.</p></div>
 </dd>
 <dt id="fieldedge_pcap.pcap.PacketStatistics"><code class="flex name class">
 <span>class <span class="ident">PacketStatistics</span></span>
-<span>(</span><span>log: logging.Logger = None, source_filename: str = None)</span>
+<span>(</span><span>source_filename: str = None)</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Encapsulates packet-level statistics from a capture over time.</p>
@@ -2296,8 +2123,6 @@ different transport or stream ID than the conversation.</p></div>
 <p>Creates a PacketStatistics object.</p>
 <h2 id="args">Args</h2>
 <dl>
-<dt><strong><code>log</code></strong></dt>
-<dd>An optional logging facility</dd>
 <dt><strong><code>source_filename</code></strong></dt>
 <dd>An optional tie to the source pcap file</dd>
 </dl></div>
@@ -2315,17 +2140,14 @@ different transport or stream ID than the conversation.</p></div>
 
     &#34;&#34;&#34;
     def __init__(self,
-                 log: Logger = None,
                  source_filename: str = None,
                  ) -&gt; None:
         &#34;&#34;&#34;Creates a PacketStatistics object.
         
         Args:
-            log: An optional logging facility
             source_filename: An optional tie to the source pcap file
 
         &#34;&#34;&#34;
-        self._log = log or get_wrapping_logger()
         self._source_filename: str = source_filename
         self.conversations: list[Conversation] = []
         self._packet_count: int = 0
@@ -2383,9 +2205,9 @@ different transport or stream ID than the conversation.</p></div>
     def _process_arp(self, packet: SharkPacket):
         arp_desc = f&#39;{packet.arp.src_proto_ipv4}--&gt;{packet.arp.dst_proto_ipv4}&#39;
         if not _is_local_traffic(packet):
-            self._log.warning(f&#39;Non-local ARP packet {arp_desc}&#39;)
+            _log.warning(f&#39;Non-local ARP packet {arp_desc}&#39;)
         else:
-            self._log.debug(f&#39;Local ARP {arp_desc} (ignored from statistics)&#39;)
+            _log.debug(f&#39;Local ARP {arp_desc} (ignored from statistics)&#39;)
 
     def _process_ip(self, packet: SharkPacket):
         in_conversation = False
@@ -2399,8 +2221,8 @@ different transport or stream ID than the conversation.</p></div>
                 in_conversation = True
                 break
         if not in_conversation:
-            self._log.debug(&#39;Found new conversation&#39;)
-            conversation = Conversation(packet, self._log)
+            _log.debug(&#39;Found new conversation&#39;)
+            conversation = Conversation(packet)
             self.conversations.append(conversation)
 
     def _process_unhandled(self, packet: SharkPacket):
@@ -2408,7 +2230,7 @@ different transport or stream ID than the conversation.</p></div>
         self._unhandled_packet_count += 1
         self._unhandled_bytes += int(packet.length)
         if packet_type not in self._unhandled_packet_types:
-            self._log.warning(f&#39;Unhandled packet type {packet_type}&#39;)
+            _log.warning(f&#39;Unhandled packet type {packet_type}&#39;)
             self._unhandled_packet_types.append(packet_type)
 
     def data_series_application_size(self) -&gt; dict:
@@ -2825,39 +2647,6 @@ tuples with (unix_timestamp, size_bytes)</p></div>
 </li>
 <li><h3><a href="#header-classes">Classes</a></h3>
 <ul>
-<li>
-<h4><code><a title="fieldedge_pcap.pcap.ApplicationPort" href="#fieldedge_pcap.pcap.ApplicationPort">ApplicationPort</a></code></h4>
-<ul class="two-column">
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_COAP" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_COAP">TCP_COAP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_COAPS" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_COAPS">TCP_COAPS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_DNP" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_DNP">TCP_DNP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_DNP2" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_DNP2">TCP_DNP2</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_DNS" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_DNS">TCP_DNS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_DOCKERAPI" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_DOCKERAPI">TCP_DOCKERAPI</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_DOCKERAPIS" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_DOCKERAPIS">TCP_DOCKERAPIS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_FTP" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_FTP">TCP_FTP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_FTPC" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_FTPC">TCP_FTPC</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_HTTP" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_HTTP">TCP_HTTP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_HTTP2" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_HTTP2">TCP_HTTP2</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_HTTPS" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_HTTPS">TCP_HTTPS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_IEC60870" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_IEC60870">TCP_IEC60870</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_IMAP" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_IMAP">TCP_IMAP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_MODBUS" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_MODBUS">TCP_MODBUS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_MODBUSS" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_MODBUSS">TCP_MODBUSS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_MQTT" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_MQTT">TCP_MQTT</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_MQTTS" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_MQTTS">TCP_MQTTS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_RDP" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_RDP">TCP_RDP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_SMTP" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_SMTP">TCP_SMTP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_SRCP" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_SRCP">TCP_SRCP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_SSH" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_SSH">TCP_SSH</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.TCP_TELNET" href="#fieldedge_pcap.pcap.ApplicationPort.TCP_TELNET">TCP_TELNET</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.UDP_DHCPQ" href="#fieldedge_pcap.pcap.ApplicationPort.UDP_DHCPQ">UDP_DHCPQ</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.UDP_DHCPR" href="#fieldedge_pcap.pcap.ApplicationPort.UDP_DHCPR">UDP_DHCPR</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.UDP_DNS" href="#fieldedge_pcap.pcap.ApplicationPort.UDP_DNS">UDP_DNS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.UDP_NTP" href="#fieldedge_pcap.pcap.ApplicationPort.UDP_NTP">UDP_NTP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.ApplicationPort.UDP_SNMP" href="#fieldedge_pcap.pcap.ApplicationPort.UDP_SNMP">UDP_SNMP</a></code></li>
-</ul>
-</li>
 <li>
 <h4><code><a title="fieldedge_pcap.pcap.Conversation" href="#fieldedge_pcap.pcap.Conversation">Conversation</a></code></h4>
 <ul class="">
