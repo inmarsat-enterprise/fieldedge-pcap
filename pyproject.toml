@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fieldedge-pcap"
-version = "0.2.4"
+version = "0.2.5"
 description = "Library and models for working with packet capture and analysis."
 authors = ["geoffbrucepayne <geoff.bruce-payne@inmarsat.com>"]
 license = "Apache2.0"
