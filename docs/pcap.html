@@ -51,10 +51,13 @@ report by exception be used with a less frequent update pushed?
 
 &#34;&#34;&#34;
 import asyncio
+import io
 import json
 import logging
 import os
 import statistics
+import sys
+import traceback
 from datetime import datetime
 from enum import Enum
 from multiprocessing import Queue
@@ -65,6 +68,11 @@ from pyshark.capture.capture import TSharkCrashException
 from pyshark.packet.packet import Packet as SharkPacket
 
 _log = logging.getLogger(__name__)
+
+LOCALNET_172 = str(os.getenv(&#39;LOCALNET_172&#39;, True)) == &#39;True&#39;
+LOCALNET_192 = str(os.getenv(&#39;LOCALNET_192&#39;, True)) == &#39;True&#39;
+DEBUG_PACKET_NUMBER = int(os.getenv(&#39;DEBUG_PACKET_NUMBER&#39;, 0))
+DEBUG_VERBOSE = str(os.getenv(&#39;DEBUG_VERBOSE&#39;, False)).lower() == &#39;true&#39;
 
 
 class EthernetProtocol(Enum):
@@ -96,7 +104,7 @@ class KnownTcpPorts(Enum):
     &#34;&#34;&#34;Mappings for common registered/known application layer TCP ports.&#34;&#34;&#34;
     SMTP = 25
     HTTP = 80
-    HTTPS = 443
+    HTTP_TLS = 443
     DNS = 53
     FTP = 20
     FTPC = 21
@@ -111,10 +119,10 @@ class KnownTcpPorts(Enum):
     MQTT_TLS = 8883
     MQTT_SOCKET = 9001
     DOCKERAPI = 2375
-    DOCKERAPIS = 2376
+    DOCKERAPI_TLS = 2376
     SRCP = 4303
     COAP = 5683
-    COAPS = 5684
+    COAP_TLS = 5684
     DNP2 = 19999
     DNP = 20000
     IEC60870 = 2404
@@ -129,7 +137,7 @@ class KnownUdpPorts(Enum):
     NTP = 123
 
 
-def _get_src_dst(packet: SharkPacket) -&gt; tuple:
+def _get_src_dst(packet: SharkPacket) -&gt; &#39;tuple[str,str]&#39;:
     &#34;&#34;&#34;Returns the packet source and destination hosts as a tuple.
     
     Args:
@@ -139,9 +147,12 @@ def _get_src_dst(packet: SharkPacket) -&gt; tuple:
         A tuple with (source, destination) IP addresses
     &#34;&#34;&#34;
     if hasattr(packet, &#39;arp&#39;):
-        return (packet.arp.src_proto_ipv4, packet.arp.dst_proto_ipv4)
+        return (str(packet.arp.src_proto_ipv4), str(packet.arp.dst_proto_ipv4))
     elif hasattr(packet, &#39;ip&#39;):
-        return (packet.ip.src, packet.ip.dst)
+        return (str(packet.ip.src), str(packet.ip.dst))
+    elif hasattr(packet, &#39;ipv6&#39;):
+        # return (str(packet.ipv6.src), str(packet.ipv6.dst))
+        raise NotImplementedError(f&#39;IPV6 unsupported&#39;)
     else:
         raise NotImplementedError(f&#39;Unable to determine src/dst&#39;
                                   f&#39; for {packet.highest_layer}&#39;)
@@ -179,42 +190,46 @@ def _get_application(packet: SharkPacket) -&gt; str:
     Returns:
         A string with the application layer protocol e.g. `TCP_MQTTS`
     &#34;&#34;&#34;
-    application = None
-    if hasattr(packet[packet.highest_layer], &#39;app_data_proto&#39;):
-        application = str(packet[packet.highest_layer].app_data_proto).upper()
-    elif packet.transport_layer:
-        (srcport, dstport) = _get_ports(packet)
-        if packet.transport_layer == &#39;TCP&#39;:
-            known_ports = tuple(item.value for item in KnownTcpPorts)
-            if srcport in known_ports:
-                application = f&#39;TCP_{KnownTcpPorts(srcport).name}&#39;
-            elif dstport in known_ports:
-                application = f&#39;TCP_{KnownTcpPorts(dstport).name}&#39;
-        elif packet.transport_layer == &#39;UDP&#39;:
-            known_ports = tuple(item.value for item in KnownUdpPorts)
-            if srcport in known_ports:
-                application = f&#39;UDP_{KnownUdpPorts(srcport).name}&#39;
-            elif dstport in known_ports:
-                application = f&#39;UDP_{KnownUdpPorts(dstport).name}&#39;
-        if not application:   # and packet.transport_layer != packet.highest_layer:
-            application = f&#39;{str(packet.transport_layer).upper()}&#39;
-            if packet.transport_layer != packet.highest_layer:
-                application += f&#39;_{str(packet.highest_layer).upper()}&#39;
-            else:
-                application += f&#39;_{dstport}&#39;
+    highest_layer: str = packet.highest_layer
+    transport_layer: str = &#39;&#39;
+    if packet.transport_layer:
+        transport_layer = packet.transport_layer
     else:
         try:
             transport_layer = str(packet.layers[2].layer_name).upper()
-            highest_layer = str(packet.highest_layer).upper()
-            application = f&#39;{transport_layer}_{highest_layer}&#39;
         except Exception as err:
             _log.error(err)
-            application = f&#39;{str(packet.highest_layer).upper()}&#39;
+    application = &#39;&#39;
+    if hasattr(packet[highest_layer], &#39;app_data_proto&#39;):
+        application = str(packet[highest_layer].app_data_proto).upper()
+    if transport_layer:
+        if not application:
+            (srcport, dstport) = _get_ports(packet)
+            ports_lookup = None
+            if transport_layer == &#39;TCP&#39;:
+                ports_lookup = KnownTcpPorts
+            elif transport_layer == &#39;UDP&#39;:
+                ports_lookup = KnownUdpPorts
+            if ports_lookup:
+                known_ports = tuple(item.value for item in ports_lookup)
+                if srcport in known_ports:
+                    application = ports_lookup(srcport).name
+                elif dstport in known_ports:
+                    application = ports_lookup(dstport).name
+            else:
+                if transport_layer != highest_layer:
+                    application = highest_layer.upper()
+                else:
+                    application += f&#39;{dstport}&#39;
+        application = f&#39;{transport_layer}_{application}&#39;
     # identified workarounds for observed pyshark/tshark app_data_proto
     if not application:
         application = f&#39;{str(packet.highest_layer).upper()}_UNKNOWN&#39;
-    if &#39;HTTP-OVER-TLS&#39; in application:
-        application = application.replace(&#39;HTTP-OVER-TLS&#39;, &#39;HTTPS&#39;)
+    application = application.replace(&#39;HTTP-OVER-TLS&#39;, &#39;HTTP_TLS&#39;)
+    if highest_layer == &#39;TLS&#39; and not application.endswith(&#39;_TLS&#39;):
+        application += &#39;_TLS&#39;
+    if not (application.startswith(&#39;TCP_&#39;) or application.startswith(&#39;UDP_&#39;)):
+        _log.warning(f&#39;Transport layer unknown for packet {packet.number}&#39;)
     return application
 
 
@@ -257,6 +272,38 @@ def is_private_ip(ip_addr: str) -&gt; bool:
     return False
 
 
+def _is_localnet_172(addr: str) -&gt; bool:
+    if (addr.startswith(&#39;172.&#39;) and
+        int(addr.split(&#39;.&#39;)[1] in range(16, 31 + 1))):
+        return True
+    return False
+
+
+def _is_localnet_192(addr: str) -&gt; bool:
+    if addr.startswith(&#39;192.168.&#39;):
+        return True
+    return False
+
+
+def _is_same_subnet(src: str, dst: str) -&gt; bool:
+    src_parts = src.split(&#39;.&#39;)
+    dst_parts = dst.split(&#39;.&#39;)
+    for part in range(0, 3):
+        if src_parts[part] != dst_parts[part]:
+            return False
+    return True
+
+
+def _is_multicast(addr: str) -&gt; bool:
+    MULTICAST_RANGE = (224, 239 + 1)
+    first_octet = int(addr.split(&#39;.&#39;)[0])
+    if first_octet == 255:
+        return True
+    elif first_octet in range(MULTICAST_RANGE[0], MULTICAST_RANGE[1]):
+        return True
+    return False
+
+
 def _is_local_traffic(packet: SharkPacket) -&gt; bool:
     &#34;&#34;&#34;Returns true if the source is on the LAN and destinations are cast.
     
@@ -266,18 +313,53 @@ def _is_local_traffic(packet: SharkPacket) -&gt; bool:
     Returns:
         True if both addresses are in the LAN range 192.168.x.y 
     &#34;&#34;&#34;
-    CAST_ADDRESSES = [
-        &#39;255.255.255.255&#39;,
-    ]
-    MULTICAST_RANGE = (224, 239)
     src, dst = _get_src_dst(packet)
-    if src.startswith(&#39;192.168.&#39;):
-        dst_first_octet = int(dst.split(&#39;.&#39;)[0])
-        if (dst in CAST_ADDRESSES or 
-            dst_first_octet &gt;= MULTICAST_RANGE[0] and
-            dst_first_octet &lt;= MULTICAST_RANGE[1]):
+    if LOCALNET_172:
+        if (_is_localnet_172(src) and _is_localnet_172(dst) and
+            _is_same_subnet(src, dst)):
+            # if DEBUG_VERBOSE:
+            #     _log.debug(f&#39;Local LAN packet {src} -&gt; {dst}&#39;)
             return True
+        if ((_is_localnet_172(src) and _is_multicast(dst)) or
+            (_is_multicast(src) and _is_localnet_172(dst))):
+            # if DEBUG_VERBOSE:
+            #     _log.debug(f&#39;Local multicast packet {src} -&gt; {dst}&#39;)
+            return True
+    if LOCALNET_192:
+        if (_is_localnet_192(src) and _is_localnet_192(dst) and
+            _is_same_subnet(src, dst)):
+            # if DEBUG_VERBOSE:
+            #     _log.debug(f&#39;Local LAN packet {src} -&gt; {dst}&#39;)
+            return True
+        if ((_is_localnet_192(src) and _is_multicast(dst)) or
+            (_is_multicast(src) and _is_localnet_192(dst))):
+            # if DEBUG_VERBOSE:
+            #     _log.debug(f&#39;Local multicast packet {src} -&gt; {dst}&#39;)
+            return True
+    if _is_multicast(src) and _is_multicast(dst):
+        # if DEBUG_VERBOSE:
+        #     _log.debug(f&#39;Local multicast packet {src} -&gt; {dst}&#39;)
+        return True
     return False
+
+
+def _is_tcp_reset(packet: SharkPacket) -&gt; bool:
+    # TODO: look for RST flag
+    raise NotImplementedError
+
+
+def _check_flags(packet: SharkPacket) -&gt; &#39;dict|None&#39;:
+    # TODO: tcp.analysis.flags &amp;&amp; !tcp.analysis.window_update &amp;&amp; !tcp.analysis.keep_alive &amp;&amp; !tcp.analysis.keep_alive_ack
+    # TODO: tcp.analysis.retransmission
+    IGNORE = [
+        &#39;analysis_flags&#39;,
+    ]
+    if hasattr(packet, &#39;tcp&#39;) and hasattr(packet.tcp, &#39;analysis_flags&#39;):
+        bad_packet = {}
+        for attr in dir(packet.tcp):
+            if attr.startswith(&#39;analysis_&#39;) and attr not in IGNORE:
+                bad_packet[attr] = getattr(packet.tcp, attr)
+        return bad_packet
 
 
 def _clean_path(pathname: str) -&gt; str:
@@ -313,6 +395,7 @@ class SimplePacket:
         dst (str): Destination IP address
         srcport (int): Source port
         dstport (int): Destination port
+        bad_packet (dict): Metadata present if the packet is suspected to be bad
 
     &#34;&#34;&#34;
     def __init__(self, packet: SharkPacket, parent_hosts: tuple) -&gt; None:
@@ -334,6 +417,7 @@ class SimplePacket:
         self.highest_layer = str(packet.highest_layer).upper()
         self.application = _get_application(packet)
         self.a_b = True if self.src == self._parent_hosts[0] else False
+        self.bad_packet = _check_flags(packet)
 
 
 class Conversation:
@@ -347,12 +431,20 @@ class Conversation:
         stream_id: The stream ID from the tshark capture
         transport: The transport used e.g. TCP, UDP
         ports: A list of transport ports used e.g. [1883]
+        start_ts: The unix timestamp of the first packet sent
         packets: A list of all the packets summarized
         packet_count: The size of the packets list
         bytes_total: The total number of bytes in the conversation
+        bad_packet_count: The number of suspected bad packets
+            (includes retransmit)
+        bytes_bad: The byte count of the suspected bad packets
+            (includes retransmitted bytes)
+        retransmit_count: The number of suspected retransmitted packets
+        bytes_retransmit: The total retransmitted bytes
 
     &#34;&#34;&#34;
-    def __init__(self, packet: SharkPacket = None):
+    def __init__(self, packet: SharkPacket = None, number: int = None):
+        self.number = number
         self.application: str = None
         self.hosts: tuple = None
         self.a_b: int = 0
@@ -360,9 +452,13 @@ class Conversation:
         self.stream_id: str = None
         self.transport: str = None
         self.ports: list = []
-        self.packets: list[SimplePacket] = []
+        self.packets: &#39;list[SimplePacket]&#39; = []
         self.packet_count: int = 0
+        self.bad_packet_count: int = 0
+        self.retransmit_count: int = 0
         self.bytes_total: int = 0
+        self.bytes_bad: int = 0
+        self.bytes_retransmit: int = 0
         self.start_ts: float = None
         if packet is not None:
             self.packet_add(packet)
@@ -418,6 +514,7 @@ class Conversation:
         if self.hosts is None:
             self.hosts = _get_src_dst(packet)
         elif not(self.is_packet_in_flow(packet)):
+            _log.warning(f&#39;Packet {packet.number} not in flow {self.number}&#39;)
             return False
         try:
             simple_packet = SimplePacket(packet, self.hosts)
@@ -425,11 +522,14 @@ class Conversation:
             _log.error(err)
             raise err
         isotime = datetime.utcfromtimestamp(simple_packet.timestamp).isoformat()[0:23]
-        _log.debug(f&#39;{isotime}|{simple_packet.application}|&#39;
-                   f&#39;({simple_packet.transport}.{simple_packet.stream_id}&#39;
-                   f&#39;:{simple_packet.dstport})&#39;
-                   f&#39;|{simple_packet.size} bytes&#39;
-                   f&#39;|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
+        if DEBUG_VERBOSE:
+            _log.debug(f&#39;Adding packet {packet.number}&#39;
+                       f&#39; to conversation {self.number or 0}:&#39;
+                       f&#39;{isotime}|{simple_packet.application}|&#39;
+                       f&#39;({simple_packet.transport}.{simple_packet.stream_id}&#39;
+                       f&#39;:{simple_packet.dstport})&#39;
+                       f&#39;|{simple_packet.size} bytes&#39;
+                       f&#39;|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
         if simple_packet.src == self.hosts[0]:
             self.a_b += 1
         else:
@@ -443,7 +543,7 @@ class Conversation:
         if self.stream_id is None:
             self.stream_id = simple_packet.stream_id
         elif simple_packet.stream_id != self.stream_id:
-            err = (f&#39;Expected stream {self.stream_id}&#39;
+            err = (f&#39;Packet {packet.number} expected stream {self.stream_id}&#39;
                    f&#39; but got {simple_packet.stream_id}&#39;)
             _log.error(err)
             raise ValueError(err)
@@ -451,13 +551,22 @@ class Conversation:
         self.bytes_total += simple_packet.size
         if self.start_ts is None:
             self.start_ts = simple_packet.timestamp
-        # TODO: can likely remove the try/except below
         try:
+            if simple_packet.bad_packet:
+                if &#39;analysis_retransmission&#39; in simple_packet.bad_packet:
+                    self.retransmit_count += 1
+                    self.bytes_retransmit += simple_packet.size
+                self.bad_packet_count += 1
+                self.bytes_bad += simple_packet.size
+                if DEBUG_VERBOSE:
+                    _log.debug(f&#39;Bad packet {packet.number}&#39;
+                               f&#39; ({simple_packet.bad_packet})&#39;)
             self.packets.append(simple_packet)
             if self.application is None:
                 self.application = simple_packet.application
             elif self.application != simple_packet.application:
-                _log.warning(f&#39;Expected application {self.application}&#39;
+                _log.warning(f&#39;Packet {packet.number}&#39;
+                             f&#39; expected application {self.application}&#39;
                              f&#39; but got {simple_packet.application}&#39;)
             return True
         except Exception as err:
@@ -514,6 +623,17 @@ class Conversation:
             datapoint = (packet.timestamp, packet.size)
             series.append(datapoint)
         return series
+
+    def data_series_packet_size_good_bad(self) -&gt; &#39;tuple[list, list]&#39;:
+        good_series = []
+        bad_series = []
+        for packet in self.packets:
+            datapoint = (packet.timestamp, packet.size)
+            if not packet.bad_packet:
+                good_series.append(datapoint)
+            else:
+                bad_series.append(datapoint)
+        return (good_series, bad_series)
 
     def group_packets_by_size(self) -&gt; tuple:
         &#34;&#34;&#34;Creates dictionaries keyed by similar packet size and direction.
@@ -639,11 +759,14 @@ class PacketStatistics:
         if not _is_local_traffic(packet):
             _log.warning(f&#39;Non-local ARP packet {arp_desc}&#39;)
         else:
-            _log.debug(f&#39;Local ARP {arp_desc} (ignored from statistics)&#39;)
+            if DEBUG_VERBOSE:
+                _log.debug(f&#39;Local ARP {arp_desc} (ignored from statistics)&#39;)
 
     def _process_ip(self, packet: SharkPacket):
         in_conversation = False
         if _is_local_traffic(packet):
+            if DEBUG_VERBOSE:
+                _log.debug(f&#39;Ignoring packet {packet.number} local traffic&#39;)
             self._local_packet_count += 1
             self._local_bytes += int(packet.length)
             return
@@ -653,8 +776,10 @@ class PacketStatistics:
                 in_conversation = True
                 break
         if not in_conversation:
-            _log.debug(&#39;Found new conversation&#39;)
-            conversation = Conversation(packet)
+            conversation_number = len(self.conversations) + 1
+            if DEBUG_VERBOSE:
+                _log.debug(f&#39;Found new conversation ({conversation_number})&#39;)
+            conversation = Conversation(packet, conversation_number)
             self.conversations.append(conversation)
 
     def _process_unhandled(self, packet: SharkPacket):
@@ -662,17 +787,21 @@ class PacketStatistics:
         self._unhandled_packet_count += 1
         self._unhandled_bytes += int(packet.length)
         if packet_type not in self._unhandled_packet_types:
-            _log.warning(f&#39;Unhandled packet type {packet_type}&#39;)
+            _log.warning(f&#39;Packet {packet.number}&#39;
+                         f&#39; unhandled packet type {packet_type}&#39;)
             self._unhandled_packet_types.append(packet_type)
 
-    def data_series_application_size(self) -&gt; dict:
+    def data_series_application_size(self, split_bad: bool = False) -&gt; dict:
         &#34;&#34;&#34;Returns a set of data series by conversation application.
         
         Example: {&#39;MQTT&#39;: [(12345.67, 42)]}
 
+        Args:
+            split_bad: if True will split out bad packets as a series.
+
         Returns:
             A dictionary with keys showing the application and values are
-                tuples with (unix_timestamp, size_bytes)
+                tuples with (unix_timestamp, size_in_bytes)
 
         &#34;&#34;&#34;
         multi_series = {}
@@ -713,13 +842,18 @@ class PacketStatistics:
             hosts_str = str(conversation.hosts)
             intervals = conversation.intervals()
             intervals.pop(&#39;hosts&#39;, None)
-            i_tag = &#39;packet_intervals&#39;
+            bad_packet_count = conversation.bad_packet_count
             if hosts_str not in results:
                 results[hosts_str] = {
                     &#39;count&#39;: 1,
                     &#39;applications&#39;: [conversation.application],
                     &#39;start_times&#39;: [conversation.start_ts],
-                    i_tag: intervals,
+                    &#39;packet_intervals&#39;: intervals,
+                    &#39;bytes&#39;: conversation.bytes_total,
+                    &#39;bad_packet_count&#39;: bad_packet_count,
+                    &#39;bytes_bad&#39;: conversation.bytes_bad,
+                    &#39;retransmit_count&#39;: conversation.retransmit_count,
+                    &#39;retransmit_bytes&#39;: conversation.bytes_retransmit,
                 }
             else:
                 results[hosts_str][&#39;count&#39;] += 1
@@ -727,8 +861,9 @@ class PacketStatistics:
                 if app not in results[hosts_str][&#39;applications&#39;]:
                     results[hosts_str][&#39;applications&#39;].append(app)
                 results[hosts_str][&#39;start_times&#39;].append(conversation.start_ts)
-                prior = results[hosts_str][i_tag]
-                results[hosts_str][i_tag] = {**prior, **intervals}
+                prior = results[hosts_str][&#39;packet_intervals&#39;]
+                results[hosts_str][&#39;packet_intervals&#39;] = {**prior, **intervals}
+                results[hosts_str][&#39;bad_packet_count&#39;] += bad_packet_count
         for key in results:
             times = results[key][&#39;start_times&#39;]
             results[key][&#39;repeat_mean&#39;] = None
@@ -820,19 +955,36 @@ def process_pcap(filename: str,
                                   eventloop=loop)
     capture.set_debug(debug)
     packet_number = 0
+    handled_exceptions = []
     for packet in capture:
+        assert isinstance(packet, SharkPacket)
         packet_number += 1
         # DEV: Uncomment below for specific step-through troubleshooting
-        # if packet_number == 15:
-        #     _log.info(&#39;Problem packet...&#39;)
+        if DEBUG_PACKET_NUMBER and packet_number == DEBUG_PACKET_NUMBER:
+            _log.info(f&#39;Investigate packet: {int(packet.number)}&#39;)
         try:
             packet_stats.packet_add(packet)
         except NotImplementedError as err:
-            _log.error(f&#39;pyshark: {err}&#39;)
+            if str(err) not in handled_exceptions:
+                sio = io.StringIO()
+                ei = sys.exc_info()
+                tb = ei[2]
+                traceback.print_exception(ei[0], ei[1], tb, None, sio)
+                s = sio.getvalue()
+                sio.close()
+                stack = s.split(&#39;\n&#39;)
+                #: each stack call is 2 lines, the last 2 lines are the error
+                #:   so the last call meta is 4-deep and the call itself 3-deep
+                last_call = stack[-4:-2]
+                err_prefix = &#39;pyshark&#39;
+                if &#39;fieldedge_pcap/pcap.py&#39; in last_call[0]:
+                    err_prefix = &#39;fieldedge_pcap&#39;
+                _log.warning(f&#39;{err_prefix} (packet {packet.number}): {err}&#39;)
+                handled_exceptions.append(str(err))
         except TSharkCrashException as err:
-            _log.error(f&#39;tshark: {err}&#39;)
+            _log.error(f&#39;tshark (packet {packet_number}): {err}&#39;)
             break
-        except Exception:
+        except:
             #TODO: better error capture e.g. appears to have been cut short use editcap
             # https://tshark.dev/share/pcap_preparation/
             _log.exception(f&#39;Packet {packet_number} processing ERROR&#39;)
@@ -943,7 +1095,7 @@ def create_pcap(interface: str = &#39;eth1&#39;,
 <h2 class="section-title" id="header-functions">Functions</h2>
 <dl>
 <dt id="fieldedge_pcap.pcap.create_pcap"><code class="name flex">
-<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10eca2b38>> = None, debug: bool = False) ‑> str</span>
+<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10a056da0>> = None, debug: bool = False) ‑> str</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Creates a packet capture file of a specified interface.</p>
@@ -1167,7 +1319,7 @@ should have a returncode 0.</p>
 </details>
 </dd>
 <dt id="fieldedge_pcap.pcap.process_pcap"><code class="name flex">
-<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10eca2b38>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
+<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10a056da0>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
 </code></dt>
 <dd>
 <div class="desc"><p>Processes a PCAP file to create metrics for conversations.</p>
@@ -1262,19 +1414,36 @@ process.join()
                                   eventloop=loop)
     capture.set_debug(debug)
     packet_number = 0
+    handled_exceptions = []
     for packet in capture:
+        assert isinstance(packet, SharkPacket)
         packet_number += 1
         # DEV: Uncomment below for specific step-through troubleshooting
-        # if packet_number == 15:
-        #     _log.info(&#39;Problem packet...&#39;)
+        if DEBUG_PACKET_NUMBER and packet_number == DEBUG_PACKET_NUMBER:
+            _log.info(f&#39;Investigate packet: {int(packet.number)}&#39;)
         try:
             packet_stats.packet_add(packet)
         except NotImplementedError as err:
-            _log.error(f&#39;pyshark: {err}&#39;)
+            if str(err) not in handled_exceptions:
+                sio = io.StringIO()
+                ei = sys.exc_info()
+                tb = ei[2]
+                traceback.print_exception(ei[0], ei[1], tb, None, sio)
+                s = sio.getvalue()
+                sio.close()
+                stack = s.split(&#39;\n&#39;)
+                #: each stack call is 2 lines, the last 2 lines are the error
+                #:   so the last call meta is 4-deep and the call itself 3-deep
+                last_call = stack[-4:-2]
+                err_prefix = &#39;pyshark&#39;
+                if &#39;fieldedge_pcap/pcap.py&#39; in last_call[0]:
+                    err_prefix = &#39;fieldedge_pcap&#39;
+                _log.warning(f&#39;{err_prefix} (packet {packet.number}): {err}&#39;)
+                handled_exceptions.append(str(err))
         except TSharkCrashException as err:
-            _log.error(f&#39;tshark: {err}&#39;)
+            _log.error(f&#39;tshark (packet {packet_number}): {err}&#39;)
             break
-        except Exception:
+        except:
             #TODO: better error capture e.g. appears to have been cut short use editcap
             # https://tshark.dev/share/pcap_preparation/
             _log.exception(f&#39;Packet {packet_number} processing ERROR&#39;)
@@ -1295,7 +1464,7 @@ process.join()
 <dl>
 <dt id="fieldedge_pcap.pcap.Conversation"><code class="flex name class">
 <span>class <span class="ident">Conversation</span></span>
-<span>(</span><span>packet: pyshark.packet.packet.Packet = None)</span>
+<span>(</span><span>packet: pyshark.packet.packet.Packet = None, number: int = None)</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Encapsulates all traffic between two endpoints.</p>
@@ -1315,12 +1484,24 @@ process.join()
 <dd>The transport used e.g. TCP, UDP</dd>
 <dt><strong><code>ports</code></strong></dt>
 <dd>A list of transport ports used e.g. [1883]</dd>
+<dt><strong><code>start_ts</code></strong></dt>
+<dd>The unix timestamp of the first packet sent</dd>
 <dt><strong><code>packets</code></strong></dt>
 <dd>A list of all the packets summarized</dd>
 <dt><strong><code>packet_count</code></strong></dt>
 <dd>The size of the packets list</dd>
 <dt><strong><code>bytes_total</code></strong></dt>
 <dd>The total number of bytes in the conversation</dd>
+<dt><strong><code>bad_packet_count</code></strong></dt>
+<dd>The number of suspected bad packets
+(includes retransmit)</dd>
+<dt><strong><code>bytes_bad</code></strong></dt>
+<dd>The byte count of the suspected bad packets
+(includes retransmitted bytes)</dd>
+<dt><strong><code>retransmit_count</code></strong></dt>
+<dd>The number of suspected retransmitted packets</dd>
+<dt><strong><code>bytes_retransmit</code></strong></dt>
+<dd>The total retransmitted bytes</dd>
 </dl></div>
 <details class="source">
 <summary>
@@ -1337,12 +1518,20 @@ process.join()
         stream_id: The stream ID from the tshark capture
         transport: The transport used e.g. TCP, UDP
         ports: A list of transport ports used e.g. [1883]
+        start_ts: The unix timestamp of the first packet sent
         packets: A list of all the packets summarized
         packet_count: The size of the packets list
         bytes_total: The total number of bytes in the conversation
+        bad_packet_count: The number of suspected bad packets
+            (includes retransmit)
+        bytes_bad: The byte count of the suspected bad packets
+            (includes retransmitted bytes)
+        retransmit_count: The number of suspected retransmitted packets
+        bytes_retransmit: The total retransmitted bytes
 
     &#34;&#34;&#34;
-    def __init__(self, packet: SharkPacket = None):
+    def __init__(self, packet: SharkPacket = None, number: int = None):
+        self.number = number
         self.application: str = None
         self.hosts: tuple = None
         self.a_b: int = 0
@@ -1350,9 +1539,13 @@ process.join()
         self.stream_id: str = None
         self.transport: str = None
         self.ports: list = []
-        self.packets: list[SimplePacket] = []
+        self.packets: &#39;list[SimplePacket]&#39; = []
         self.packet_count: int = 0
+        self.bad_packet_count: int = 0
+        self.retransmit_count: int = 0
         self.bytes_total: int = 0
+        self.bytes_bad: int = 0
+        self.bytes_retransmit: int = 0
         self.start_ts: float = None
         if packet is not None:
             self.packet_add(packet)
@@ -1408,6 +1601,7 @@ process.join()
         if self.hosts is None:
             self.hosts = _get_src_dst(packet)
         elif not(self.is_packet_in_flow(packet)):
+            _log.warning(f&#39;Packet {packet.number} not in flow {self.number}&#39;)
             return False
         try:
             simple_packet = SimplePacket(packet, self.hosts)
@@ -1415,11 +1609,14 @@ process.join()
             _log.error(err)
             raise err
         isotime = datetime.utcfromtimestamp(simple_packet.timestamp).isoformat()[0:23]
-        _log.debug(f&#39;{isotime}|{simple_packet.application}|&#39;
-                   f&#39;({simple_packet.transport}.{simple_packet.stream_id}&#39;
-                   f&#39;:{simple_packet.dstport})&#39;
-                   f&#39;|{simple_packet.size} bytes&#39;
-                   f&#39;|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
+        if DEBUG_VERBOSE:
+            _log.debug(f&#39;Adding packet {packet.number}&#39;
+                       f&#39; to conversation {self.number or 0}:&#39;
+                       f&#39;{isotime}|{simple_packet.application}|&#39;
+                       f&#39;({simple_packet.transport}.{simple_packet.stream_id}&#39;
+                       f&#39;:{simple_packet.dstport})&#39;
+                       f&#39;|{simple_packet.size} bytes&#39;
+                       f&#39;|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
         if simple_packet.src == self.hosts[0]:
             self.a_b += 1
         else:
@@ -1433,7 +1630,7 @@ process.join()
         if self.stream_id is None:
             self.stream_id = simple_packet.stream_id
         elif simple_packet.stream_id != self.stream_id:
-            err = (f&#39;Expected stream {self.stream_id}&#39;
+            err = (f&#39;Packet {packet.number} expected stream {self.stream_id}&#39;
                    f&#39; but got {simple_packet.stream_id}&#39;)
             _log.error(err)
             raise ValueError(err)
@@ -1441,13 +1638,22 @@ process.join()
         self.bytes_total += simple_packet.size
         if self.start_ts is None:
             self.start_ts = simple_packet.timestamp
-        # TODO: can likely remove the try/except below
         try:
+            if simple_packet.bad_packet:
+                if &#39;analysis_retransmission&#39; in simple_packet.bad_packet:
+                    self.retransmit_count += 1
+                    self.bytes_retransmit += simple_packet.size
+                self.bad_packet_count += 1
+                self.bytes_bad += simple_packet.size
+                if DEBUG_VERBOSE:
+                    _log.debug(f&#39;Bad packet {packet.number}&#39;
+                               f&#39; ({simple_packet.bad_packet})&#39;)
             self.packets.append(simple_packet)
             if self.application is None:
                 self.application = simple_packet.application
             elif self.application != simple_packet.application:
-                _log.warning(f&#39;Expected application {self.application}&#39;
+                _log.warning(f&#39;Packet {packet.number}&#39;
+                             f&#39; expected application {self.application}&#39;
                              f&#39; but got {simple_packet.application}&#39;)
             return True
         except Exception as err:
@@ -1504,6 +1710,17 @@ process.join()
             datapoint = (packet.timestamp, packet.size)
             series.append(datapoint)
         return series
+
+    def data_series_packet_size_good_bad(self) -&gt; &#39;tuple[list, list]&#39;:
+        good_series = []
+        bad_series = []
+        for packet in self.packets:
+            datapoint = (packet.timestamp, packet.size)
+            if not packet.bad_packet:
+                good_series.append(datapoint)
+            else:
+                bad_series.append(datapoint)
+        return (good_series, bad_series)
 
     def group_packets_by_size(self) -&gt; tuple:
         &#34;&#34;&#34;Creates dictionaries keyed by similar packet size and direction.
@@ -1579,6 +1796,27 @@ process.join()
         datapoint = (packet.timestamp, packet.size)
         series.append(datapoint)
     return series</code></pre>
+</details>
+</dd>
+<dt id="fieldedge_pcap.pcap.Conversation.data_series_packet_size_good_bad"><code class="name flex">
+<span>def <span class="ident">data_series_packet_size_good_bad</span></span>(<span>self) ‑> tuple[list, list]</span>
+</code></dt>
+<dd>
+<div class="desc"></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def data_series_packet_size_good_bad(self) -&gt; &#39;tuple[list, list]&#39;:
+    good_series = []
+    bad_series = []
+    for packet in self.packets:
+        datapoint = (packet.timestamp, packet.size)
+        if not packet.bad_packet:
+            good_series.append(datapoint)
+        else:
+            bad_series.append(datapoint)
+    return (good_series, bad_series)</code></pre>
 </details>
 </dd>
 <dt id="fieldedge_pcap.pcap.Conversation.group_packets_by_size"><code class="name flex">
@@ -1743,6 +1981,7 @@ different transport or stream ID than the conversation.</p></div>
     if self.hosts is None:
         self.hosts = _get_src_dst(packet)
     elif not(self.is_packet_in_flow(packet)):
+        _log.warning(f&#39;Packet {packet.number} not in flow {self.number}&#39;)
         return False
     try:
         simple_packet = SimplePacket(packet, self.hosts)
@@ -1750,11 +1989,14 @@ different transport or stream ID than the conversation.</p></div>
         _log.error(err)
         raise err
     isotime = datetime.utcfromtimestamp(simple_packet.timestamp).isoformat()[0:23]
-    _log.debug(f&#39;{isotime}|{simple_packet.application}|&#39;
-               f&#39;({simple_packet.transport}.{simple_packet.stream_id}&#39;
-               f&#39;:{simple_packet.dstport})&#39;
-               f&#39;|{simple_packet.size} bytes&#39;
-               f&#39;|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
+    if DEBUG_VERBOSE:
+        _log.debug(f&#39;Adding packet {packet.number}&#39;
+                   f&#39; to conversation {self.number or 0}:&#39;
+                   f&#39;{isotime}|{simple_packet.application}|&#39;
+                   f&#39;({simple_packet.transport}.{simple_packet.stream_id}&#39;
+                   f&#39;:{simple_packet.dstport})&#39;
+                   f&#39;|{simple_packet.size} bytes&#39;
+                   f&#39;|{simple_packet.src}--&gt;{simple_packet.dst}&#39;)
     if simple_packet.src == self.hosts[0]:
         self.a_b += 1
     else:
@@ -1768,7 +2010,7 @@ different transport or stream ID than the conversation.</p></div>
     if self.stream_id is None:
         self.stream_id = simple_packet.stream_id
     elif simple_packet.stream_id != self.stream_id:
-        err = (f&#39;Expected stream {self.stream_id}&#39;
+        err = (f&#39;Packet {packet.number} expected stream {self.stream_id}&#39;
                f&#39; but got {simple_packet.stream_id}&#39;)
         _log.error(err)
         raise ValueError(err)
@@ -1776,13 +2018,22 @@ different transport or stream ID than the conversation.</p></div>
     self.bytes_total += simple_packet.size
     if self.start_ts is None:
         self.start_ts = simple_packet.timestamp
-    # TODO: can likely remove the try/except below
     try:
+        if simple_packet.bad_packet:
+            if &#39;analysis_retransmission&#39; in simple_packet.bad_packet:
+                self.retransmit_count += 1
+                self.bytes_retransmit += simple_packet.size
+            self.bad_packet_count += 1
+            self.bytes_bad += simple_packet.size
+            if DEBUG_VERBOSE:
+                _log.debug(f&#39;Bad packet {packet.number}&#39;
+                           f&#39; ({simple_packet.bad_packet})&#39;)
         self.packets.append(simple_packet)
         if self.application is None:
             self.application = simple_packet.application
         elif self.application != simple_packet.application:
-            _log.warning(f&#39;Expected application {self.application}&#39;
+            _log.warning(f&#39;Packet {packet.number}&#39;
+                         f&#39; expected application {self.application}&#39;
                          f&#39; but got {simple_packet.application}&#39;)
         return True
     except Exception as err:
@@ -1932,7 +2183,7 @@ different transport or stream ID than the conversation.</p></div>
     &#34;&#34;&#34;Mappings for common registered/known application layer TCP ports.&#34;&#34;&#34;
     SMTP = 25
     HTTP = 80
-    HTTPS = 443
+    HTTP_TLS = 443
     DNS = 53
     FTP = 20
     FTPC = 21
@@ -1947,10 +2198,10 @@ different transport or stream ID than the conversation.</p></div>
     MQTT_TLS = 8883
     MQTT_SOCKET = 9001
     DOCKERAPI = 2375
-    DOCKERAPIS = 2376
+    DOCKERAPI_TLS = 2376
     SRCP = 4303
     COAP = 5683
-    COAPS = 5684
+    COAP_TLS = 5684
     DNP2 = 19999
     DNP = 20000
     IEC60870 = 2404</code></pre>
@@ -1965,7 +2216,7 @@ different transport or stream ID than the conversation.</p></div>
 <dd>
 <div class="desc"></div>
 </dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.COAPS"><code class="name">var <span class="ident">COAPS</span></code></dt>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.COAP_TLS"><code class="name">var <span class="ident">COAP_TLS</span></code></dt>
 <dd>
 <div class="desc"></div>
 </dd>
@@ -1985,7 +2236,7 @@ different transport or stream ID than the conversation.</p></div>
 <dd>
 <div class="desc"></div>
 </dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPIS"><code class="name">var <span class="ident">DOCKERAPIS</span></code></dt>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI_TLS"><code class="name">var <span class="ident">DOCKERAPI_TLS</span></code></dt>
 <dd>
 <div class="desc"></div>
 </dd>
@@ -2005,7 +2256,7 @@ different transport or stream ID than the conversation.</p></div>
 <dd>
 <div class="desc"></div>
 </dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.HTTPS"><code class="name">var <span class="ident">HTTPS</span></code></dt>
+<dt id="fieldedge_pcap.pcap.KnownTcpPorts.HTTP_TLS"><code class="name">var <span class="ident">HTTP_TLS</span></code></dt>
 <dd>
 <div class="desc"></div>
 </dd>
@@ -2207,11 +2458,14 @@ different transport or stream ID than the conversation.</p></div>
         if not _is_local_traffic(packet):
             _log.warning(f&#39;Non-local ARP packet {arp_desc}&#39;)
         else:
-            _log.debug(f&#39;Local ARP {arp_desc} (ignored from statistics)&#39;)
+            if DEBUG_VERBOSE:
+                _log.debug(f&#39;Local ARP {arp_desc} (ignored from statistics)&#39;)
 
     def _process_ip(self, packet: SharkPacket):
         in_conversation = False
         if _is_local_traffic(packet):
+            if DEBUG_VERBOSE:
+                _log.debug(f&#39;Ignoring packet {packet.number} local traffic&#39;)
             self._local_packet_count += 1
             self._local_bytes += int(packet.length)
             return
@@ -2221,8 +2475,10 @@ different transport or stream ID than the conversation.</p></div>
                 in_conversation = True
                 break
         if not in_conversation:
-            _log.debug(&#39;Found new conversation&#39;)
-            conversation = Conversation(packet)
+            conversation_number = len(self.conversations) + 1
+            if DEBUG_VERBOSE:
+                _log.debug(f&#39;Found new conversation ({conversation_number})&#39;)
+            conversation = Conversation(packet, conversation_number)
             self.conversations.append(conversation)
 
     def _process_unhandled(self, packet: SharkPacket):
@@ -2230,17 +2486,21 @@ different transport or stream ID than the conversation.</p></div>
         self._unhandled_packet_count += 1
         self._unhandled_bytes += int(packet.length)
         if packet_type not in self._unhandled_packet_types:
-            _log.warning(f&#39;Unhandled packet type {packet_type}&#39;)
+            _log.warning(f&#39;Packet {packet.number}&#39;
+                         f&#39; unhandled packet type {packet_type}&#39;)
             self._unhandled_packet_types.append(packet_type)
 
-    def data_series_application_size(self) -&gt; dict:
+    def data_series_application_size(self, split_bad: bool = False) -&gt; dict:
         &#34;&#34;&#34;Returns a set of data series by conversation application.
         
         Example: {&#39;MQTT&#39;: [(12345.67, 42)]}
 
+        Args:
+            split_bad: if True will split out bad packets as a series.
+
         Returns:
             A dictionary with keys showing the application and values are
-                tuples with (unix_timestamp, size_bytes)
+                tuples with (unix_timestamp, size_in_bytes)
 
         &#34;&#34;&#34;
         multi_series = {}
@@ -2281,13 +2541,18 @@ different transport or stream ID than the conversation.</p></div>
             hosts_str = str(conversation.hosts)
             intervals = conversation.intervals()
             intervals.pop(&#39;hosts&#39;, None)
-            i_tag = &#39;packet_intervals&#39;
+            bad_packet_count = conversation.bad_packet_count
             if hosts_str not in results:
                 results[hosts_str] = {
                     &#39;count&#39;: 1,
                     &#39;applications&#39;: [conversation.application],
                     &#39;start_times&#39;: [conversation.start_ts],
-                    i_tag: intervals,
+                    &#39;packet_intervals&#39;: intervals,
+                    &#39;bytes&#39;: conversation.bytes_total,
+                    &#39;bad_packet_count&#39;: bad_packet_count,
+                    &#39;bytes_bad&#39;: conversation.bytes_bad,
+                    &#39;retransmit_count&#39;: conversation.retransmit_count,
+                    &#39;retransmit_bytes&#39;: conversation.bytes_retransmit,
                 }
             else:
                 results[hosts_str][&#39;count&#39;] += 1
@@ -2295,8 +2560,9 @@ different transport or stream ID than the conversation.</p></div>
                 if app not in results[hosts_str][&#39;applications&#39;]:
                     results[hosts_str][&#39;applications&#39;].append(app)
                 results[hosts_str][&#39;start_times&#39;].append(conversation.start_ts)
-                prior = results[hosts_str][i_tag]
-                results[hosts_str][i_tag] = {**prior, **intervals}
+                prior = results[hosts_str][&#39;packet_intervals&#39;]
+                results[hosts_str][&#39;packet_intervals&#39;] = {**prior, **intervals}
+                results[hosts_str][&#39;bad_packet_count&#39;] += bad_packet_count
         for key in results:
             times = results[key][&#39;start_times&#39;]
             results[key][&#39;repeat_mean&#39;] = None
@@ -2427,13 +2693,18 @@ repeat_stdev: <code>int</code>
         hosts_str = str(conversation.hosts)
         intervals = conversation.intervals()
         intervals.pop(&#39;hosts&#39;, None)
-        i_tag = &#39;packet_intervals&#39;
+        bad_packet_count = conversation.bad_packet_count
         if hosts_str not in results:
             results[hosts_str] = {
                 &#39;count&#39;: 1,
                 &#39;applications&#39;: [conversation.application],
                 &#39;start_times&#39;: [conversation.start_ts],
-                i_tag: intervals,
+                &#39;packet_intervals&#39;: intervals,
+                &#39;bytes&#39;: conversation.bytes_total,
+                &#39;bad_packet_count&#39;: bad_packet_count,
+                &#39;bytes_bad&#39;: conversation.bytes_bad,
+                &#39;retransmit_count&#39;: conversation.retransmit_count,
+                &#39;retransmit_bytes&#39;: conversation.bytes_retransmit,
             }
         else:
             results[hosts_str][&#39;count&#39;] += 1
@@ -2441,8 +2712,9 @@ repeat_stdev: <code>int</code>
             if app not in results[hosts_str][&#39;applications&#39;]:
                 results[hosts_str][&#39;applications&#39;].append(app)
             results[hosts_str][&#39;start_times&#39;].append(conversation.start_ts)
-            prior = results[hosts_str][i_tag]
-            results[hosts_str][i_tag] = {**prior, **intervals}
+            prior = results[hosts_str][&#39;packet_intervals&#39;]
+            results[hosts_str][&#39;packet_intervals&#39;] = {**prior, **intervals}
+            results[hosts_str][&#39;bad_packet_count&#39;] += bad_packet_count
     for key in results:
         times = results[key][&#39;start_times&#39;]
         results[key][&#39;repeat_mean&#39;] = None
@@ -2461,26 +2733,34 @@ repeat_stdev: <code>int</code>
 </details>
 </dd>
 <dt id="fieldedge_pcap.pcap.PacketStatistics.data_series_application_size"><code class="name flex">
-<span>def <span class="ident">data_series_application_size</span></span>(<span>self) ‑> dict</span>
+<span>def <span class="ident">data_series_application_size</span></span>(<span>self, split_bad: bool = False) ‑> dict</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Returns a set of data series by conversation application.</p>
 <p>Example: {'MQTT': [(12345.67, 42)]}</p>
+<h2 id="args">Args</h2>
+<dl>
+<dt><strong><code>split_bad</code></strong></dt>
+<dd>if True will split out bad packets as a series.</dd>
+</dl>
 <h2 id="returns">Returns</h2>
 <p>A dictionary with keys showing the application and values are
-tuples with (unix_timestamp, size_bytes)</p></div>
+tuples with (unix_timestamp, size_in_bytes)</p></div>
 <details class="source">
 <summary>
 <span>Expand source code</span>
 </summary>
-<pre><code class="python">def data_series_application_size(self) -&gt; dict:
+<pre><code class="python">def data_series_application_size(self, split_bad: bool = False) -&gt; dict:
     &#34;&#34;&#34;Returns a set of data series by conversation application.
     
     Example: {&#39;MQTT&#39;: [(12345.67, 42)]}
 
+    Args:
+        split_bad: if True will split out bad packets as a series.
+
     Returns:
         A dictionary with keys showing the application and values are
-            tuples with (unix_timestamp, size_bytes)
+            tuples with (unix_timestamp, size_in_bytes)
 
     &#34;&#34;&#34;
     multi_series = {}
@@ -2580,6 +2860,8 @@ tuples with (unix_timestamp, size_bytes)</p></div>
 <dd>Source port</dd>
 <dt><strong><code>dstport</code></strong> :&ensp;<code>int</code></dt>
 <dd>Destination port</dd>
+<dt><strong><code>bad_packet</code></strong> :&ensp;<code>dict</code></dt>
+<dd>Metadata present if the packet is suspected to be bad</dd>
 </dl></div>
 <details class="source">
 <summary>
@@ -2599,6 +2881,7 @@ tuples with (unix_timestamp, size_bytes)</p></div>
         dst (str): Destination IP address
         srcport (int): Source port
         dstport (int): Destination port
+        bad_packet (dict): Metadata present if the packet is suspected to be bad
 
     &#34;&#34;&#34;
     def __init__(self, packet: SharkPacket, parent_hosts: tuple) -&gt; None:
@@ -2619,7 +2902,8 @@ tuples with (unix_timestamp, size_bytes)</p></div>
         self.srcport, self.dstport = _get_ports(packet)
         self.highest_layer = str(packet.highest_layer).upper()
         self.application = _get_application(packet)
-        self.a_b = True if self.src == self._parent_hosts[0] else False</code></pre>
+        self.a_b = True if self.src == self._parent_hosts[0] else False
+        self.bad_packet = _check_flags(packet)</code></pre>
 </details>
 </dd>
 </dl>
@@ -2651,6 +2935,7 @@ tuples with (unix_timestamp, size_bytes)</p></div>
 <h4><code><a title="fieldedge_pcap.pcap.Conversation" href="#fieldedge_pcap.pcap.Conversation">Conversation</a></code></h4>
 <ul class="">
 <li><code><a title="fieldedge_pcap.pcap.Conversation.data_series_packet_size" href="#fieldedge_pcap.pcap.Conversation.data_series_packet_size">data_series_packet_size</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.Conversation.data_series_packet_size_good_bad" href="#fieldedge_pcap.pcap.Conversation.data_series_packet_size_good_bad">data_series_packet_size_good_bad</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.Conversation.group_packets_by_size" href="#fieldedge_pcap.pcap.Conversation.group_packets_by_size">group_packets_by_size</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.Conversation.intervals" href="#fieldedge_pcap.pcap.Conversation.intervals">intervals</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.Conversation.is_packet_in_flow" href="#fieldedge_pcap.pcap.Conversation.is_packet_in_flow">is_packet_in_flow</a></code></li>
@@ -2687,17 +2972,17 @@ tuples with (unix_timestamp, size_bytes)</p></div>
 <h4><code><a title="fieldedge_pcap.pcap.KnownTcpPorts" href="#fieldedge_pcap.pcap.KnownTcpPorts">KnownTcpPorts</a></code></h4>
 <ul class="two-column">
 <li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.COAP" href="#fieldedge_pcap.pcap.KnownTcpPorts.COAP">COAP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.COAPS" href="#fieldedge_pcap.pcap.KnownTcpPorts.COAPS">COAPS</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.COAP_TLS" href="#fieldedge_pcap.pcap.KnownTcpPorts.COAP_TLS">COAP_TLS</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DNP" href="#fieldedge_pcap.pcap.KnownTcpPorts.DNP">DNP</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DNP2" href="#fieldedge_pcap.pcap.KnownTcpPorts.DNP2">DNP2</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DNS" href="#fieldedge_pcap.pcap.KnownTcpPorts.DNS">DNS</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI" href="#fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI">DOCKERAPI</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPIS" href="#fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPIS">DOCKERAPIS</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI_TLS" href="#fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI_TLS">DOCKERAPI_TLS</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.FTP" href="#fieldedge_pcap.pcap.KnownTcpPorts.FTP">FTP</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.FTPC" href="#fieldedge_pcap.pcap.KnownTcpPorts.FTPC">FTPC</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.HTTP" href="#fieldedge_pcap.pcap.KnownTcpPorts.HTTP">HTTP</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.HTTP2" href="#fieldedge_pcap.pcap.KnownTcpPorts.HTTP2">HTTP2</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.HTTPS" href="#fieldedge_pcap.pcap.KnownTcpPorts.HTTPS">HTTPS</a></code></li>
+<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.HTTP_TLS" href="#fieldedge_pcap.pcap.KnownTcpPorts.HTTP_TLS">HTTP_TLS</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.IEC60870" href="#fieldedge_pcap.pcap.KnownTcpPorts.IEC60870">IEC60870</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.IMAP" href="#fieldedge_pcap.pcap.KnownTcpPorts.IMAP">IMAP</a></code></li>
 <li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.MODBUS" href="#fieldedge_pcap.pcap.KnownTcpPorts.MODBUS">MODBUS</a></code></li>

@@ -12,10 +12,13 @@ report by exception be used with a less frequent update pushed?
 
 """
 import asyncio
+import io
 import json
 import logging
 import os
 import statistics
+import sys
+import traceback
 from datetime import datetime
 from enum import Enum
 from multiprocessing import Queue
@@ -26,6 +29,11 @@ from pyshark.capture.capture import TSharkCrashException
 from pyshark.packet.packet import Packet as SharkPacket
 
 _log = logging.getLogger(__name__)
+
+LOCALNET_172 = str(os.getenv('LOCALNET_172', True)) == 'True'
+LOCALNET_192 = str(os.getenv('LOCALNET_192', True)) == 'True'
+DEBUG_PACKET_NUMBER = int(os.getenv('DEBUG_PACKET_NUMBER', 0))
+DEBUG_VERBOSE = str(os.getenv('DEBUG_VERBOSE', False)).lower() == 'true'
 
 
 class EthernetProtocol(Enum):
@@ -57,7 +65,7 @@ class KnownTcpPorts(Enum):
     """Mappings for common registered/known application layer TCP ports."""
     SMTP = 25
     HTTP = 80
-    HTTPS = 443
+    HTTP_TLS = 443
     DNS = 53
     FTP = 20
     FTPC = 21
@@ -72,10 +80,10 @@ class KnownTcpPorts(Enum):
     MQTT_TLS = 8883
     MQTT_SOCKET = 9001
     DOCKERAPI = 2375
-    DOCKERAPIS = 2376
+    DOCKERAPI_TLS = 2376
     SRCP = 4303
     COAP = 5683
-    COAPS = 5684
+    COAP_TLS = 5684
     DNP2 = 19999
     DNP = 20000
     IEC60870 = 2404
@@ -90,7 +98,7 @@ class KnownUdpPorts(Enum):
     NTP = 123
 
 
-def _get_src_dst(packet: SharkPacket) -> tuple:
+def _get_src_dst(packet: SharkPacket) -> 'tuple[str,str]':
     """Returns the packet source and destination hosts as a tuple.
     
     Args:
@@ -100,9 +108,12 @@ def _get_src_dst(packet: SharkPacket) -> tuple:
         A tuple with (source, destination) IP addresses
     """
     if hasattr(packet, 'arp'):
-        return (packet.arp.src_proto_ipv4, packet.arp.dst_proto_ipv4)
+        return (str(packet.arp.src_proto_ipv4), str(packet.arp.dst_proto_ipv4))
     elif hasattr(packet, 'ip'):
-        return (packet.ip.src, packet.ip.dst)
+        return (str(packet.ip.src), str(packet.ip.dst))
+    elif hasattr(packet, 'ipv6'):
+        # return (str(packet.ipv6.src), str(packet.ipv6.dst))
+        raise NotImplementedError(f'IPV6 unsupported')
     else:
         raise NotImplementedError(f'Unable to determine src/dst'
                                   f' for {packet.highest_layer}')
@@ -140,42 +151,46 @@ def _get_application(packet: SharkPacket) -> str:
     Returns:
         A string with the application layer protocol e.g. `TCP_MQTTS`
     """
-    application = None
-    if hasattr(packet[packet.highest_layer], 'app_data_proto'):
-        application = str(packet[packet.highest_layer].app_data_proto).upper()
-    elif packet.transport_layer:
-        (srcport, dstport) = _get_ports(packet)
-        if packet.transport_layer == 'TCP':
-            known_ports = tuple(item.value for item in KnownTcpPorts)
-            if srcport in known_ports:
-                application = f'TCP_{KnownTcpPorts(srcport).name}'
-            elif dstport in known_ports:
-                application = f'TCP_{KnownTcpPorts(dstport).name}'
-        elif packet.transport_layer == 'UDP':
-            known_ports = tuple(item.value for item in KnownUdpPorts)
-            if srcport in known_ports:
-                application = f'UDP_{KnownUdpPorts(srcport).name}'
-            elif dstport in known_ports:
-                application = f'UDP_{KnownUdpPorts(dstport).name}'
-        if not application:   # and packet.transport_layer != packet.highest_layer:
-            application = f'{str(packet.transport_layer).upper()}'
-            if packet.transport_layer != packet.highest_layer:
-                application += f'_{str(packet.highest_layer).upper()}'
-            else:
-                application += f'_{dstport}'
+    highest_layer: str = packet.highest_layer
+    transport_layer: str = ''
+    if packet.transport_layer:
+        transport_layer = packet.transport_layer
     else:
         try:
             transport_layer = str(packet.layers[2].layer_name).upper()
-            highest_layer = str(packet.highest_layer).upper()
-            application = f'{transport_layer}_{highest_layer}'
         except Exception as err:
             _log.error(err)
-            application = f'{str(packet.highest_layer).upper()}'
+    application = ''
+    if hasattr(packet[highest_layer], 'app_data_proto'):
+        application = str(packet[highest_layer].app_data_proto).upper()
+    if transport_layer:
+        if not application:
+            (srcport, dstport) = _get_ports(packet)
+            ports_lookup = None
+            if transport_layer == 'TCP':
+                ports_lookup = KnownTcpPorts
+            elif transport_layer == 'UDP':
+                ports_lookup = KnownUdpPorts
+            if ports_lookup:
+                known_ports = tuple(item.value for item in ports_lookup)
+                if srcport in known_ports:
+                    application = ports_lookup(srcport).name
+                elif dstport in known_ports:
+                    application = ports_lookup(dstport).name
+            else:
+                if transport_layer != highest_layer:
+                    application = highest_layer.upper()
+                else:
+                    application += f'{dstport}'
+        application = f'{transport_layer}_{application}'
     # identified workarounds for observed pyshark/tshark app_data_proto
     if not application:
         application = f'{str(packet.highest_layer).upper()}_UNKNOWN'
-    if 'HTTP-OVER-TLS' in application:
-        application = application.replace('HTTP-OVER-TLS', 'HTTPS')
+    application = application.replace('HTTP-OVER-TLS', 'HTTP_TLS')
+    if highest_layer == 'TLS' and not application.endswith('_TLS'):
+        application += '_TLS'
+    if not (application.startswith('TCP_') or application.startswith('UDP_')):
+        _log.warning(f'Transport layer unknown for packet {packet.number}')
     return application
 
 
@@ -218,6 +233,38 @@ def is_private_ip(ip_addr: str) -> bool:
     return False
 
 
+def _is_localnet_172(addr: str) -> bool:
+    if (addr.startswith('172.') and
+        int(addr.split('.')[1] in range(16, 31 + 1))):
+        return True
+    return False
+
+
+def _is_localnet_192(addr: str) -> bool:
+    if addr.startswith('192.168.'):
+        return True
+    return False
+
+
+def _is_same_subnet(src: str, dst: str) -> bool:
+    src_parts = src.split('.')
+    dst_parts = dst.split('.')
+    for part in range(0, 3):
+        if src_parts[part] != dst_parts[part]:
+            return False
+    return True
+
+
+def _is_multicast(addr: str) -> bool:
+    MULTICAST_RANGE = (224, 239 + 1)
+    first_octet = int(addr.split('.')[0])
+    if first_octet == 255:
+        return True
+    elif first_octet in range(MULTICAST_RANGE[0], MULTICAST_RANGE[1]):
+        return True
+    return False
+
+
 def _is_local_traffic(packet: SharkPacket) -> bool:
     """Returns true if the source is on the LAN and destinations are cast.
     
@@ -227,18 +274,53 @@ def _is_local_traffic(packet: SharkPacket) -> bool:
     Returns:
         True if both addresses are in the LAN range 192.168.x.y 
     """
-    CAST_ADDRESSES = [
-        '255.255.255.255',
-    ]
-    MULTICAST_RANGE = (224, 239)
     src, dst = _get_src_dst(packet)
-    if src.startswith('192.168.'):
-        dst_first_octet = int(dst.split('.')[0])
-        if (dst in CAST_ADDRESSES or 
-            dst_first_octet >= MULTICAST_RANGE[0] and
-            dst_first_octet <= MULTICAST_RANGE[1]):
+    if LOCALNET_172:
+        if (_is_localnet_172(src) and _is_localnet_172(dst) and
+            _is_same_subnet(src, dst)):
+            # if DEBUG_VERBOSE:
+            #     _log.debug(f'Local LAN packet {src} -> {dst}')
             return True
+        if ((_is_localnet_172(src) and _is_multicast(dst)) or
+            (_is_multicast(src) and _is_localnet_172(dst))):
+            # if DEBUG_VERBOSE:
+            #     _log.debug(f'Local multicast packet {src} -> {dst}')
+            return True
+    if LOCALNET_192:
+        if (_is_localnet_192(src) and _is_localnet_192(dst) and
+            _is_same_subnet(src, dst)):
+            # if DEBUG_VERBOSE:
+            #     _log.debug(f'Local LAN packet {src} -> {dst}')
+            return True
+        if ((_is_localnet_192(src) and _is_multicast(dst)) or
+            (_is_multicast(src) and _is_localnet_192(dst))):
+            # if DEBUG_VERBOSE:
+            #     _log.debug(f'Local multicast packet {src} -> {dst}')
+            return True
+    if _is_multicast(src) and _is_multicast(dst):
+        # if DEBUG_VERBOSE:
+        #     _log.debug(f'Local multicast packet {src} -> {dst}')
+        return True
     return False
+
+
+def _is_tcp_reset(packet: SharkPacket) -> bool:
+    # TODO: look for RST flag
+    raise NotImplementedError
+
+
+def _check_flags(packet: SharkPacket) -> 'dict|None':
+    # TODO: tcp.analysis.flags && !tcp.analysis.window_update && !tcp.analysis.keep_alive && !tcp.analysis.keep_alive_ack
+    # TODO: tcp.analysis.retransmission
+    IGNORE = [
+        'analysis_flags',
+    ]
+    if hasattr(packet, 'tcp') and hasattr(packet.tcp, 'analysis_flags'):
+        bad_packet = {}
+        for attr in dir(packet.tcp):
+            if attr.startswith('analysis_') and attr not in IGNORE:
+                bad_packet[attr] = getattr(packet.tcp, attr)
+        return bad_packet
 
 
 def _clean_path(pathname: str) -> str:
@@ -274,6 +356,7 @@ class SimplePacket:
         dst (str): Destination IP address
         srcport (int): Source port
         dstport (int): Destination port
+        bad_packet (dict): Metadata present if the packet is suspected to be bad
 
     """
     def __init__(self, packet: SharkPacket, parent_hosts: tuple) -> None:
@@ -295,6 +378,7 @@ class SimplePacket:
         self.highest_layer = str(packet.highest_layer).upper()
         self.application = _get_application(packet)
         self.a_b = True if self.src == self._parent_hosts[0] else False
+        self.bad_packet = _check_flags(packet)
 
 
 class Conversation:
@@ -308,12 +392,20 @@ class Conversation:
         stream_id: The stream ID from the tshark capture
         transport: The transport used e.g. TCP, UDP
         ports: A list of transport ports used e.g. [1883]
+        start_ts: The unix timestamp of the first packet sent
         packets: A list of all the packets summarized
         packet_count: The size of the packets list
         bytes_total: The total number of bytes in the conversation
+        bad_packet_count: The number of suspected bad packets
+            (includes retransmit)
+        bytes_bad: The byte count of the suspected bad packets
+            (includes retransmitted bytes)
+        retransmit_count: The number of suspected retransmitted packets
+        bytes_retransmit: The total retransmitted bytes
 
     """
-    def __init__(self, packet: SharkPacket = None):
+    def __init__(self, packet: SharkPacket = None, number: int = None):
+        self.number = number
         self.application: str = None
         self.hosts: tuple = None
         self.a_b: int = 0
@@ -321,9 +413,13 @@ class Conversation:
         self.stream_id: str = None
         self.transport: str = None
         self.ports: list = []
-        self.packets: list[SimplePacket] = []
+        self.packets: 'list[SimplePacket]' = []
         self.packet_count: int = 0
+        self.bad_packet_count: int = 0
+        self.retransmit_count: int = 0
         self.bytes_total: int = 0
+        self.bytes_bad: int = 0
+        self.bytes_retransmit: int = 0
         self.start_ts: float = None
         if packet is not None:
             self.packet_add(packet)
@@ -379,6 +475,7 @@ class Conversation:
         if self.hosts is None:
             self.hosts = _get_src_dst(packet)
         elif not(self.is_packet_in_flow(packet)):
+            _log.warning(f'Packet {packet.number} not in flow {self.number}')
             return False
         try:
             simple_packet = SimplePacket(packet, self.hosts)
@@ -386,11 +483,14 @@ class Conversation:
             _log.error(err)
             raise err
         isotime = datetime.utcfromtimestamp(simple_packet.timestamp).isoformat()[0:23]
-        _log.debug(f'{isotime}|{simple_packet.application}|'
-                   f'({simple_packet.transport}.{simple_packet.stream_id}'
-                   f':{simple_packet.dstport})'
-                   f'|{simple_packet.size} bytes'
-                   f'|{simple_packet.src}-->{simple_packet.dst}')
+        if DEBUG_VERBOSE:
+            _log.debug(f'Adding packet {packet.number}'
+                       f' to conversation {self.number or 0}:'
+                       f'{isotime}|{simple_packet.application}|'
+                       f'({simple_packet.transport}.{simple_packet.stream_id}'
+                       f':{simple_packet.dstport})'
+                       f'|{simple_packet.size} bytes'
+                       f'|{simple_packet.src}-->{simple_packet.dst}')
         if simple_packet.src == self.hosts[0]:
             self.a_b += 1
         else:
@@ -404,7 +504,7 @@ class Conversation:
         if self.stream_id is None:
             self.stream_id = simple_packet.stream_id
         elif simple_packet.stream_id != self.stream_id:
-            err = (f'Expected stream {self.stream_id}'
+            err = (f'Packet {packet.number} expected stream {self.stream_id}'
                    f' but got {simple_packet.stream_id}')
             _log.error(err)
             raise ValueError(err)
@@ -412,13 +512,22 @@ class Conversation:
         self.bytes_total += simple_packet.size
         if self.start_ts is None:
             self.start_ts = simple_packet.timestamp
-        # TODO: can likely remove the try/except below
         try:
+            if simple_packet.bad_packet:
+                if 'analysis_retransmission' in simple_packet.bad_packet:
+                    self.retransmit_count += 1
+                    self.bytes_retransmit += simple_packet.size
+                self.bad_packet_count += 1
+                self.bytes_bad += simple_packet.size
+                if DEBUG_VERBOSE:
+                    _log.debug(f'Bad packet {packet.number}'
+                               f' ({simple_packet.bad_packet})')
             self.packets.append(simple_packet)
             if self.application is None:
                 self.application = simple_packet.application
             elif self.application != simple_packet.application:
-                _log.warning(f'Expected application {self.application}'
+                _log.warning(f'Packet {packet.number}'
+                             f' expected application {self.application}'
                              f' but got {simple_packet.application}')
             return True
         except Exception as err:
@@ -475,6 +584,17 @@ class Conversation:
             datapoint = (packet.timestamp, packet.size)
             series.append(datapoint)
         return series
+
+    def data_series_packet_size_good_bad(self) -> 'tuple[list, list]':
+        good_series = []
+        bad_series = []
+        for packet in self.packets:
+            datapoint = (packet.timestamp, packet.size)
+            if not packet.bad_packet:
+                good_series.append(datapoint)
+            else:
+                bad_series.append(datapoint)
+        return (good_series, bad_series)
 
     def group_packets_by_size(self) -> tuple:
         """Creates dictionaries keyed by similar packet size and direction.
@@ -600,11 +720,14 @@ class PacketStatistics:
         if not _is_local_traffic(packet):
             _log.warning(f'Non-local ARP packet {arp_desc}')
         else:
-            _log.debug(f'Local ARP {arp_desc} (ignored from statistics)')
+            if DEBUG_VERBOSE:
+                _log.debug(f'Local ARP {arp_desc} (ignored from statistics)')
 
     def _process_ip(self, packet: SharkPacket):
         in_conversation = False
         if _is_local_traffic(packet):
+            if DEBUG_VERBOSE:
+                _log.debug(f'Ignoring packet {packet.number} local traffic')
             self._local_packet_count += 1
             self._local_bytes += int(packet.length)
             return
@@ -614,8 +737,10 @@ class PacketStatistics:
                 in_conversation = True
                 break
         if not in_conversation:
-            _log.debug('Found new conversation')
-            conversation = Conversation(packet)
+            conversation_number = len(self.conversations) + 1
+            if DEBUG_VERBOSE:
+                _log.debug(f'Found new conversation ({conversation_number})')
+            conversation = Conversation(packet, conversation_number)
             self.conversations.append(conversation)
 
     def _process_unhandled(self, packet: SharkPacket):
@@ -623,17 +748,21 @@ class PacketStatistics:
         self._unhandled_packet_count += 1
         self._unhandled_bytes += int(packet.length)
         if packet_type not in self._unhandled_packet_types:
-            _log.warning(f'Unhandled packet type {packet_type}')
+            _log.warning(f'Packet {packet.number}'
+                         f' unhandled packet type {packet_type}')
             self._unhandled_packet_types.append(packet_type)
 
-    def data_series_application_size(self) -> dict:
+    def data_series_application_size(self, split_bad: bool = False) -> dict:
         """Returns a set of data series by conversation application.
         
         Example: {'MQTT': [(12345.67, 42)]}
 
+        Args:
+            split_bad: if True will split out bad packets as a series.
+
         Returns:
             A dictionary with keys showing the application and values are
-                tuples with (unix_timestamp, size_bytes)
+                tuples with (unix_timestamp, size_in_bytes)
 
         """
         multi_series = {}
@@ -674,13 +803,18 @@ class PacketStatistics:
             hosts_str = str(conversation.hosts)
             intervals = conversation.intervals()
             intervals.pop('hosts', None)
-            i_tag = 'packet_intervals'
+            bad_packet_count = conversation.bad_packet_count
             if hosts_str not in results:
                 results[hosts_str] = {
                     'count': 1,
                     'applications': [conversation.application],
                     'start_times': [conversation.start_ts],
-                    i_tag: intervals,
+                    'packet_intervals': intervals,
+                    'bytes': conversation.bytes_total,
+                    'bad_packet_count': bad_packet_count,
+                    'bytes_bad': conversation.bytes_bad,
+                    'retransmit_count': conversation.retransmit_count,
+                    'retransmit_bytes': conversation.bytes_retransmit,
                 }
             else:
                 results[hosts_str]['count'] += 1
@@ -688,8 +822,9 @@ class PacketStatistics:
                 if app not in results[hosts_str]['applications']:
                     results[hosts_str]['applications'].append(app)
                 results[hosts_str]['start_times'].append(conversation.start_ts)
-                prior = results[hosts_str][i_tag]
-                results[hosts_str][i_tag] = {**prior, **intervals}
+                prior = results[hosts_str]['packet_intervals']
+                results[hosts_str]['packet_intervals'] = {**prior, **intervals}
+                results[hosts_str]['bad_packet_count'] += bad_packet_count
         for key in results:
             times = results[key]['start_times']
             results[key]['repeat_mean'] = None
@@ -781,19 +916,36 @@ def process_pcap(filename: str,
                                   eventloop=loop)
     capture.set_debug(debug)
     packet_number = 0
+    handled_exceptions = []
     for packet in capture:
+        assert isinstance(packet, SharkPacket)
         packet_number += 1
         # DEV: Uncomment below for specific step-through troubleshooting
-        # if packet_number == 15:
-        #     _log.info('Problem packet...')
+        if DEBUG_PACKET_NUMBER and packet_number == DEBUG_PACKET_NUMBER:
+            _log.info(f'Investigate packet: {int(packet.number)}')
         try:
             packet_stats.packet_add(packet)
         except NotImplementedError as err:
-            _log.error(f'pyshark: {err}')
+            if str(err) not in handled_exceptions:
+                sio = io.StringIO()
+                ei = sys.exc_info()
+                tb = ei[2]
+                traceback.print_exception(ei[0], ei[1], tb, None, sio)
+                s = sio.getvalue()
+                sio.close()
+                stack = s.split('\n')
+                #: each stack call is 2 lines, the last 2 lines are the error
+                #:   so the last call meta is 4-deep and the call itself 3-deep
+                last_call = stack[-4:-2]
+                err_prefix = 'pyshark'
+                if 'fieldedge_pcap/pcap.py' in last_call[0]:
+                    err_prefix = 'fieldedge_pcap'
+                _log.warning(f'{err_prefix} (packet {packet.number}): {err}')
+                handled_exceptions.append(str(err))
         except TSharkCrashException as err:
-            _log.error(f'tshark: {err}')
+            _log.error(f'tshark (packet {packet_number}): {err}')
             break
-        except Exception:
+        except:
             #TODO: better error capture e.g. appears to have been cut short use editcap
             # https://tshark.dev/share/pcap_preparation/
             _log.exception(f'Packet {packet_number} processing ERROR')

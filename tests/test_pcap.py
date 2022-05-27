@@ -120,6 +120,7 @@ def test_packet_statistics():
             assert isinstance(datapoint[0], float)
             assert isinstance(datapoint[1], int)
 
+
 def test_process_multiprocessing():
     """Processes a pcap separately using multiprocessing."""
     # filename = f'{TEST_DIR}/mqtts_sample.pcap'
@@ -153,6 +154,7 @@ def test_process():
     processing_time = time() - starttime
     assert isinstance(packet_stats, pcap.PacketStatistics)
 
+
 def test_unique_hosts():
     filename = f'{TEST_DIR}/capture_20211215T031635_3600.pcap'
     packet_stats = pcap.process_pcap(filename=filename)
@@ -162,10 +164,11 @@ def test_unique_hosts():
         assert hostpair not in temp
         temp.append(hostpair)
 
+
 def test_analyze_conversations():
-    filename = f'{TEST_DIR}/capture_20220303T021914_60_eth0.pcap'
+    # filename = f'{TEST_DIR}/capture_20220303T021914_60_eth0.pcap'
     # filename = f'{TEST_DIR}/capture_20211215T031635_3600.pcap'
-    # filename = f'{TEST_DIR}/capture_20220119T000001_60.pcap'
+    filename = f'{TEST_DIR}/capture_20220119T000001_60.pcap'
     packet_stats = pcap.process_pcap(filename=filename)
     analysis = packet_stats.analyze_conversations()
     assert isinstance(analysis, dict) and len(analysis) > 0
@@ -177,3 +180,14 @@ def test_analyze_conversations():
         assert 'packet_intervals' in summary
         assert 'repeat_mean' in summary
         assert 'repeat_stdev' in summary
+        assert 'bad_packet_count' in summary
+
+
+def test_data_series_application_size():
+    filename = f'{TEST_DIR}/valmont/valmont-mar17-2022.pcap'
+    packet_stats = pcap.process_pcap(filename=filename)
+    data_series = packet_stats.data_series_application_size()
+    for app, data in data_series.items():
+        assert isinstance(app, str)
+        for d in data:
+            assert d is not None
