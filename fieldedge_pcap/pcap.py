@@ -979,7 +979,7 @@ def create_pcap(interface: str = 'eth1',
                 target_directory: str = '$HOME',
                 queue: Queue = None,
                 debug: bool = False,
-                ) -> str:
+                **kwargs) -> str:
     """Creates a packet capture file of a specified interface.
 
     A subdirectory is created in the `target_directory`, if none is specified it
@@ -1014,10 +1014,12 @@ def create_pcap(interface: str = 'eth1',
     should have a returncode 0.
     
     Args:
-        interface: The interface to capture from e.g. `eth1`
-        duration: The duration of the capture in seconds
-        target_directory: The path to save the capture to
-        finish_event: A threading Event that gets set when capture is complete
+        interface: The interface to capture from e.g. `eth1`.
+        duration: The duration of the capture in seconds.
+        target_directory: The path to save the capture to.
+        queue: An optional queue to be passed in.
+        debug: A flag to enable debug logging.
+        kwargs: may include wireshark options e.g. `capture_filter`
 
     Returns:
         The full file/path name if no event is passed in.
@@ -1036,7 +1038,8 @@ def create_pcap(interface: str = 'eth1',
         loop, loop_is_new = _get_event_loop()
     capture = pyshark.LiveCapture(interface=interface,
                                   output_file=filepath,
-                                  eventloop=loop)
+                                  eventloop=loop,
+                                  **kwargs)
     capture.set_debug(debug)
     capture.sniff(timeout=duration)
     capture.close()
