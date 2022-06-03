@@ -1018,7 +1018,7 @@ def create_pcap(interface: str = &#39;eth1&#39;,
                 target_directory: str = &#39;$HOME&#39;,
                 queue: Queue = None,
                 debug: bool = False,
-                ) -&gt; str:
+                **kwargs) -&gt; str:
     &#34;&#34;&#34;Creates a packet capture file of a specified interface.
 
     A subdirectory is created in the `target_directory`, if none is specified it
@@ -1053,10 +1053,12 @@ def create_pcap(interface: str = &#39;eth1&#39;,
     should have a returncode 0.
     
     Args:
-        interface: The interface to capture from e.g. `eth1`
-        duration: The duration of the capture in seconds
-        target_directory: The path to save the capture to
-        finish_event: A threading Event that gets set when capture is complete
+        interface: The interface to capture from e.g. `eth1`.
+        duration: The duration of the capture in seconds.
+        target_directory: The path to save the capture to.
+        queue: An optional queue to be passed in.
+        debug: A flag to enable debug logging.
+        kwargs: may include wireshark options e.g. `capture_filter`
 
     Returns:
         The full file/path name if no event is passed in.
@@ -1075,7 +1077,8 @@ def create_pcap(interface: str = &#39;eth1&#39;,
         loop, loop_is_new = _get_event_loop()
     capture = pyshark.LiveCapture(interface=interface,
                                   output_file=filepath,
-                                  eventloop=loop)
+                                  eventloop=loop,
+                                  **kwargs)
     capture.set_debug(debug)
     capture.sniff(timeout=duration)
     capture.close()
@@ -1095,7 +1098,7 @@ def create_pcap(interface: str = &#39;eth1&#39;,
 <h2 class="section-title" id="header-functions">Functions</h2>
 <dl>
 <dt id="fieldedge_pcap.pcap.create_pcap"><code class="name flex">
-<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10a056da0>> = None, debug: bool = False) ‑> str</span>
+<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10c26bd68>> = None, debug: bool = False, **kwargs) ‑> str</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Creates a packet capture file of a specified interface.</p>
@@ -1130,13 +1133,17 @@ should have a returncode 0.</p>
 <h2 id="args">Args</h2>
 <dl>
 <dt><strong><code>interface</code></strong></dt>
-<dd>The interface to capture from e.g. <code>eth1</code></dd>
+<dd>The interface to capture from e.g. <code>eth1</code>.</dd>
 <dt><strong><code>duration</code></strong></dt>
-<dd>The duration of the capture in seconds</dd>
+<dd>The duration of the capture in seconds.</dd>
 <dt><strong><code>target_directory</code></strong></dt>
-<dd>The path to save the capture to</dd>
-<dt><strong><code>finish_event</code></strong></dt>
-<dd>A threading Event that gets set when capture is complete</dd>
+<dd>The path to save the capture to.</dd>
+<dt><strong><code>queue</code></strong></dt>
+<dd>An optional queue to be passed in.</dd>
+<dt><strong><code>debug</code></strong></dt>
+<dd>A flag to enable debug logging.</dd>
+<dt><strong><code>kwargs</code></strong></dt>
+<dd>may include wireshark options e.g. <code>capture_filter</code></dd>
 </dl>
 <h2 id="returns">Returns</h2>
 <p>The full file/path name if no event is passed in.</p></div>
@@ -1150,7 +1157,7 @@ should have a returncode 0.</p>
                 target_directory: str = &#39;$HOME&#39;,
                 queue: Queue = None,
                 debug: bool = False,
-                ) -&gt; str:
+                **kwargs) -&gt; str:
     &#34;&#34;&#34;Creates a packet capture file of a specified interface.
 
     A subdirectory is created in the `target_directory`, if none is specified it
@@ -1185,10 +1192,12 @@ should have a returncode 0.</p>
     should have a returncode 0.
     
     Args:
-        interface: The interface to capture from e.g. `eth1`
-        duration: The duration of the capture in seconds
-        target_directory: The path to save the capture to
-        finish_event: A threading Event that gets set when capture is complete
+        interface: The interface to capture from e.g. `eth1`.
+        duration: The duration of the capture in seconds.
+        target_directory: The path to save the capture to.
+        queue: An optional queue to be passed in.
+        debug: A flag to enable debug logging.
+        kwargs: may include wireshark options e.g. `capture_filter`
 
     Returns:
         The full file/path name if no event is passed in.
@@ -1207,7 +1216,8 @@ should have a returncode 0.</p>
         loop, loop_is_new = _get_event_loop()
     capture = pyshark.LiveCapture(interface=interface,
                                   output_file=filepath,
-                                  eventloop=loop)
+                                  eventloop=loop,
+                                  **kwargs)
     capture.set_debug(debug)
     capture.sniff(timeout=duration)
     capture.close()
@@ -1319,7 +1329,7 @@ should have a returncode 0.</p>
 </details>
 </dd>
 <dt id="fieldedge_pcap.pcap.process_pcap"><code class="name flex">
-<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10a056da0>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
+<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10c26bd68>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
 </code></dt>
 <dd>
 <div class="desc"><p>Processes a PCAP file to create metrics for conversations.</p>
