@@ -47,14 +47,18 @@ def cleanup(filename: str):
 
 def test_create():
     """Creates and reads a pcap file on a local interface."""
+    delete_file = False
+    duration = 10
+    capture_filter = 'not (arp or udp port 1900 or udp port 5353)'
     filename = pyshark.create_pcap(interface=TEST_INTERFACE,
-                                duration=10,
+                                duration=duration,
                                 target_directory=TEST_DIR,
                                 debug=True,
-                                bpf_filter='(not arp and not udp port 1900)',
+                                bpf_filter=capture_filter,
                                 )
     assert(os.path.isfile(filename))
-    cleanup(filename)
+    if delete_file:
+        cleanup(filename)
 
 
 def test_create_multiprocessing():
