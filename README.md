@@ -129,14 +129,3 @@ Conversation ('0.0.0.0', '255.255.255.255'):
   "repeat_stdev": null
 }
 ```
-
-## Docker Image
-
-In order to simplify packaging and distribution for use with Inmarsat's
-**FieldEdge** tools, a Docker image has been created targeting use on a
-`armv7` processor such as Raspberry Pi 3B+, 4 or Zero 2 W.  To use in a
-Dockerfile add the following line:
-```
-FROM inmarsat/fieldedge-pyshark:latest
-...
-```
