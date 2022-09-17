@@ -19,14 +19,15 @@ import os
 import statistics
 import sys
 import traceback
+import multiprocessing
 from datetime import datetime
-from enum import Enum
-from multiprocessing import Queue
 from pathlib import Path
 
-import pyshark
+from pyshark import FileCapture, LiveCapture
 from pyshark.capture.capture import TSharkCrashException
 from pyshark.packet.packet import Packet as SharkPacket
+
+from .constants import EthernetProtocol, KnownTcpPorts, KnownUdpPorts
 
 _log = logging.getLogger(__name__)
 
@@ -34,68 +35,6 @@ LOCALNET_172 = str(os.getenv('LOCALNET_172', True)) == 'True'
 LOCALNET_192 = str(os.getenv('LOCALNET_192', True)) == 'True'
 DEBUG_PACKET_NUMBER = int(os.getenv('DEBUG_PACKET_NUMBER', 0))
 DEBUG_VERBOSE = str(os.getenv('DEBUG_VERBOSE', False)).lower() == 'true'
-
-
-class EthernetProtocol(Enum):
-    """Mappings for Ethernet packet types."""
-    ETH_TYPE_EDP = 0x00bb  # Extreme Networks Discovery Protocol
-    ETH_TYPE_PUP = 0x0200  # PUP protocol
-    ETH_TYPE_IP = 0x0800  # IP protocol
-    ETH_TYPE_ARP = 0x0806  # address resolution protocol
-    ETH_TYPE_AOE = 0x88a2  # AoE protocol
-    ETH_TYPE_CDP = 0x2000  # Cisco Discovery Protocol
-    ETH_TYPE_DTP = 0x2004  # Cisco Dynamic Trunking Protocol
-    ETH_TYPE_REVARP = 0x8035  # reverse addr resolution protocol
-    ETH_TYPE_8021Q = 0x8100  # IEEE 802.1Q VLAN tagging
-    ETH_TYPE_8021AD = 0x88a8  # IEEE 802.1ad
-    ETH_TYPE_QINQ1 = 0x9100  # Legacy QinQ
-    ETH_TYPE_QINQ2 = 0x9200  # Legacy QinQ
-    ETH_TYPE_IPX = 0x8137  # Internetwork Packet Exchange
-    ETH_TYPE_IP6 = 0x86DD  # IPv6 protocol
-    ETH_TYPE_PPP = 0x880B  # PPP
-    ETH_TYPE_MPLS = 0x8847  # MPLS
-    ETH_TYPE_MPLS_MCAST = 0x8848  # MPLS Multicast
-    ETH_TYPE_PPPOE_DISC = 0x8863  # PPP Over Ethernet Discovery Stage
-    ETH_TYPE_PPPOE = 0x8864  # PPP Over Ethernet Session Stage
-    ETH_TYPE_LLDP = 0x88CC  # Link Layer Discovery Protocol
-    ETH_TYPE_TEB = 0x6558  # Transparent Ethernet Bridging
-
-
-class KnownTcpPorts(Enum):
-    """Mappings for common registered/known application layer TCP ports."""
-    SMTP = 25
-    HTTP = 80
-    HTTP_TLS = 443
-    DNS = 53
-    FTP = 20
-    FTPC = 21
-    TELNET = 23
-    IMAP = 143
-    RDP = 3389
-    SSH = 22
-    HTTP2 = 8080
-    MODBUS = 502
-    MODBUS_TLS = 802
-    MQTT = 1883
-    MQTT_TLS = 8883
-    MQTT_SOCKET = 9001
-    DOCKERAPI = 2375
-    DOCKERAPI_TLS = 2376
-    SRCP = 4303
-    COAP = 5683
-    COAP_TLS = 5684
-    DNP2 = 19999
-    DNP = 20000
-    IEC60870 = 2404
-
-
-class KnownUdpPorts(Enum):
-    """Mappings for common registered/known application layer TCP ports."""
-    SNMP = 161
-    DNS = 53
-    DHCP_QUERY = 67
-    DHCP_RESPONSE = 68
-    NTP = 123
 
 
 def _get_src_dst(packet: SharkPacket) -> 'tuple[str,str]':
@@ -194,7 +133,7 @@ def _get_application(packet: SharkPacket) -> str:
     return application
 
 
-def is_valid_ip(ip_addr: str) -> bool:
+def _is_valid_ip(ip_addr: str) -> bool:
     """Returns true if the string represents a valid IPv4 address.
     
     Args:
@@ -211,7 +150,7 @@ def is_valid_ip(ip_addr: str) -> bool:
     return False
 
 
-def is_private_ip(ip_addr: str) -> bool:
+def _is_private_ip(ip_addr: str) -> bool:
     """Returns true if the IPv4 address is in the private range.
     
     Args:
@@ -223,7 +162,7 @@ def is_private_ip(ip_addr: str) -> bool:
     Raises:
         ValueError if the address is invalid
     """
-    if not is_valid_ip(ip_addr):
+    if not _is_valid_ip(ip_addr):
         raise ValueError(f'IP address must be a valid IPv4 x.x.x.x')
     if (ip_addr.startswith('10.') or
         (ip_addr.startswith('172.') and
@@ -866,39 +805,15 @@ def _get_event_loop() -> tuple:
 
 def process_pcap(filename: str,
                  display_filter: str = None,
-                 queue: Queue = None,
+                 queue: multiprocessing.Queue = None,
                  debug: bool = False,
                  ) -> PacketStatistics:
     """Processes a PCAP file to create metrics for conversations.
 
-    To run in the background use a multiprocessing.Process and Queue:
-    ```
-    import multiprocessing
-    import queue
-
-    q = multiprocessing.Queue()
-    kwargs = {
-        'filename': filename,
-        'display_filter': display_filter,
-        'queue': q,
-    }
-    process = multiprocessing.Process(target=process_pcap,
-                                      name='packet_capture',
-                                      kwargs=kwargs)
-    process.start()
-    while process.is_alive():
-        try:
-            while True:
-                packet_statistics = q.get(block=False)
-        except queue.Empty:
-            pass
-    process.join()
-    ```
-    
     Args:
         filename: The path/name of the PCAP file
         display_filter: An optional tshark display filter
-        queue: An optional multiprocessing Queue (e.g. required for Flask)
+        queue: An optional multiprocessing Queue
         debug: Enables pyshark debug output
     
     Returns:
@@ -911,9 +826,9 @@ def process_pcap(filename: str,
     loop_is_new = False
     if queue is not None:
         loop, loop_is_new = _get_event_loop()
-    capture = pyshark.FileCapture(input_file=file,
-                                  display_filter=display_filter,
-                                  eventloop=loop)
+    capture = FileCapture(input_file=file,
+                          display_filter=display_filter,
+                          eventloop=loop)
     capture.set_debug(debug)
     packet_number = 0
     handled_exceptions = []
@@ -938,8 +853,8 @@ def process_pcap(filename: str,
                 #:   so the last call meta is 4-deep and the call itself 3-deep
                 last_call = stack[-4:-2]
                 err_prefix = 'pyshark'
-                if 'fieldedge_pcap/pcap.py' in last_call[0]:
-                    err_prefix = 'fieldedge_pcap'
+                if 'pcap/pyshark.py' in last_call[0]:
+                    err_prefix = 'fieldedge-pcap'
                 _log.warning(f'{err_prefix} (packet {packet.number}): {err}')
                 handled_exceptions.append(str(err))
         except TSharkCrashException as err:
@@ -969,64 +884,37 @@ def pcap_filename(duration: int, interface: str = '') -> str:
 
     """
     dt = datetime.utcnow().isoformat().replace('-', '').replace(':', '')[0:15]
-    filename = f'capture_{dt}_{duration}' + f'_{interface}' if interface else ''
+    filename = f'capture_{dt}_{duration}'
+    filename += f'_{interface}' if interface else ''
     return f'{filename}.pcap'
 
 
 def create_pcap(interface: str = 'eth1',
                 duration: int = 60,
+                bpf_filter: str = None,
                 filename: str = None,
                 target_directory: str = '$HOME',
-                queue: Queue = None,
+                queue: multiprocessing.Queue = None,
                 debug: bool = False,
                 **kwargs) -> str:
     """Creates a packet capture file of a specified interface.
 
-    A subdirectory is created in the `target_directory`, if none is specified it
-    stores to the user's home directory.
-    The subdirectory name is `capture_YYYYmmdd`.
-    The filename can be specified or `capture_YYYYmmddTHHMMSS_DDDDD.pcap`
-    format will be used.
-    To run in the background use a multiprocessing.Process and Queue:
-    ```
-    queue = multiprocessing.Queue()
-    kwargs = {
-        'interface': my_interface,
-        'duration': my_duration,
-        'filename': pcap_filename(duration),
-        'target_directory': parent_folder,
-        'queue': queue,
-    }
-    capture_process = multiprocessing.Process(target=create_pcap,
-                                              name='packet_capture',
-                                              kwargs=kwargs)
-    capture_process.start()
-    capture_process.join()
-    capture_file = queue.get()
-    ```
-
-    Often times the packet capture process will result in a corrupted file or
-    have duplicate packets.
-    To check for corruption run `tshark -r <capture_file>` which will have a
-    returncode 2 if corrupt, and stderr will include
-    'appears to have been cut short'.
-    To fix a corrupted file run `editcap <capture_file> <capture_file>` which
-    should have a returncode 0.
-    
     Args:
         interface: The interface to capture from e.g. `eth1`.
         duration: The duration of the capture in seconds.
+        bpf_filter (str): A capture filter using Berkeley Packet Filter
+            (https://biot.com/capstats/bpf.html)
         target_directory: The path to save the capture to.
-        queue: An optional queue to be passed in.
-        debug: A flag to enable debug logging.
-        kwargs: may include wireshark options e.g. `capture_filter`
+        queue: If provided, filename is stored here when the
+            capture completes.
+        debug: A flag to enable pyshark debug logging.
 
     Returns:
-        The full file/path name if no event is passed in.
+        The full file/path name if no queue is passed in.
 
     """
     if filename is None:
-        filename = pcap_filename(duration)
+        filename = pcap_filename(duration, interface)
     target_directory = _clean_path(target_directory)
     subdir = f'{target_directory}/{filename[0:len("capture_YYYYmmdd")]}'
     filepath = f'{subdir}/{filename}'
@@ -1036,16 +924,20 @@ def create_pcap(interface: str = 'eth1',
     loop_is_new = False
     if queue is not None:
         loop, loop_is_new = _get_event_loop()
-    capture = pyshark.LiveCapture(interface=interface,
-                                  output_file=filepath,
-                                  eventloop=loop,
-                                  **kwargs)
-    capture.set_debug(debug)
-    capture.sniff(timeout=duration)
-    capture.close()
-    if loop_is_new:
-        loop.close()
-    if queue is not None:
-        queue.put(filepath)
-    else:
-        return filepath
+    try:
+        capture = LiveCapture(interface=interface,
+                              bpf_filter=bpf_filter,
+                              output_file=filepath,
+                              eventloop=loop,
+                              **kwargs)
+        capture.set_debug(debug)
+        capture.sniff(timeout=duration)
+        capture.close()
+        if loop_is_new:
+            loop.close()
+        if queue is not None:
+            queue.put(filepath)
+        else:
+            return filepath
+    except Exception as err:
+        _log.exception(err)

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1" />
 <meta name="generator" content="pdoc 0.10.0" />
-<title>fieldedge_pcap.pcap API documentation</title>
+<title>fieldedge_pcap.pyshark API documentation</title>
 <meta name="description" content="A utility to parse and generate relevant metrics for analysis of a PCAP file …" />
 <link rel="preload stylesheet" as="style" href="https://cdnjs.cloudflare.com/ajax/libs/10up-sanitize.css/11.0.1/sanitize.min.css" integrity="sha256-PK9q560IAAa6WVRRh76LtCaI8pjTJ2z11v0miyNNjrs=" crossorigin>
 <link rel="preload stylesheet" as="style" href="https://cdnjs.cloudflare.com/ajax/libs/10up-sanitize.css/11.0.1/typography.min.css" integrity="sha256-7l/o7C8jubJiy74VsKTidCy1yBkRtiUGbVkYBylBqUg=" crossorigin>
@@ -19,7 +19,7 @@
 <main>
 <article id="content">
 <header>
-<h1 class="title">Module <code>fieldedge_pcap.pcap</code></h1>
+<h1 class="title">Module <code>fieldedge_pcap.pyshark</code></h1>
 </header>
 <section id="section-intro">
 <p>A utility to parse and generate relevant metrics for analysis of a PCAP file.</p>
@@ -58,14 +58,15 @@ import os
 import statistics
 import sys
 import traceback
+import multiprocessing
 from datetime import datetime
-from enum import Enum
-from multiprocessing import Queue
 from pathlib import Path
 
-import pyshark
+from pyshark import FileCapture, LiveCapture
 from pyshark.capture.capture import TSharkCrashException
 from pyshark.packet.packet import Packet as SharkPacket
+
+from .constants import EthernetProtocol, KnownTcpPorts, KnownUdpPorts
 
 _log = logging.getLogger(__name__)
 
@@ -73,68 +74,6 @@ LOCALNET_172 = str(os.getenv(&#39;LOCALNET_172&#39;, True)) == &#39;True&#39;
 LOCALNET_192 = str(os.getenv(&#39;LOCALNET_192&#39;, True)) == &#39;True&#39;
 DEBUG_PACKET_NUMBER = int(os.getenv(&#39;DEBUG_PACKET_NUMBER&#39;, 0))
 DEBUG_VERBOSE = str(os.getenv(&#39;DEBUG_VERBOSE&#39;, False)).lower() == &#39;true&#39;
-
-
-class EthernetProtocol(Enum):
-    &#34;&#34;&#34;Mappings for Ethernet packet types.&#34;&#34;&#34;
-    ETH_TYPE_EDP = 0x00bb  # Extreme Networks Discovery Protocol
-    ETH_TYPE_PUP = 0x0200  # PUP protocol
-    ETH_TYPE_IP = 0x0800  # IP protocol
-    ETH_TYPE_ARP = 0x0806  # address resolution protocol
-    ETH_TYPE_AOE = 0x88a2  # AoE protocol
-    ETH_TYPE_CDP = 0x2000  # Cisco Discovery Protocol
-    ETH_TYPE_DTP = 0x2004  # Cisco Dynamic Trunking Protocol
-    ETH_TYPE_REVARP = 0x8035  # reverse addr resolution protocol
-    ETH_TYPE_8021Q = 0x8100  # IEEE 802.1Q VLAN tagging
-    ETH_TYPE_8021AD = 0x88a8  # IEEE 802.1ad
-    ETH_TYPE_QINQ1 = 0x9100  # Legacy QinQ
-    ETH_TYPE_QINQ2 = 0x9200  # Legacy QinQ
-    ETH_TYPE_IPX = 0x8137  # Internetwork Packet Exchange
-    ETH_TYPE_IP6 = 0x86DD  # IPv6 protocol
-    ETH_TYPE_PPP = 0x880B  # PPP
-    ETH_TYPE_MPLS = 0x8847  # MPLS
-    ETH_TYPE_MPLS_MCAST = 0x8848  # MPLS Multicast
-    ETH_TYPE_PPPOE_DISC = 0x8863  # PPP Over Ethernet Discovery Stage
-    ETH_TYPE_PPPOE = 0x8864  # PPP Over Ethernet Session Stage
-    ETH_TYPE_LLDP = 0x88CC  # Link Layer Discovery Protocol
-    ETH_TYPE_TEB = 0x6558  # Transparent Ethernet Bridging
-
-
-class KnownTcpPorts(Enum):
-    &#34;&#34;&#34;Mappings for common registered/known application layer TCP ports.&#34;&#34;&#34;
-    SMTP = 25
-    HTTP = 80
-    HTTP_TLS = 443
-    DNS = 53
-    FTP = 20
-    FTPC = 21
-    TELNET = 23
-    IMAP = 143
-    RDP = 3389
-    SSH = 22
-    HTTP2 = 8080
-    MODBUS = 502
-    MODBUS_TLS = 802
-    MQTT = 1883
-    MQTT_TLS = 8883
-    MQTT_SOCKET = 9001
-    DOCKERAPI = 2375
-    DOCKERAPI_TLS = 2376
-    SRCP = 4303
-    COAP = 5683
-    COAP_TLS = 5684
-    DNP2 = 19999
-    DNP = 20000
-    IEC60870 = 2404
-
-
-class KnownUdpPorts(Enum):
-    &#34;&#34;&#34;Mappings for common registered/known application layer TCP ports.&#34;&#34;&#34;
-    SNMP = 161
-    DNS = 53
-    DHCP_QUERY = 67
-    DHCP_RESPONSE = 68
-    NTP = 123
 
 
 def _get_src_dst(packet: SharkPacket) -&gt; &#39;tuple[str,str]&#39;:
@@ -233,7 +172,7 @@ def _get_application(packet: SharkPacket) -&gt; str:
     return application
 
 
-def is_valid_ip(ip_addr: str) -&gt; bool:
+def _is_valid_ip(ip_addr: str) -&gt; bool:
     &#34;&#34;&#34;Returns true if the string represents a valid IPv4 address.
     
     Args:
@@ -250,7 +189,7 @@ def is_valid_ip(ip_addr: str) -&gt; bool:
     return False
 
 
-def is_private_ip(ip_addr: str) -&gt; bool:
+def _is_private_ip(ip_addr: str) -&gt; bool:
     &#34;&#34;&#34;Returns true if the IPv4 address is in the private range.
     
     Args:
@@ -262,7 +201,7 @@ def is_private_ip(ip_addr: str) -&gt; bool:
     Raises:
         ValueError if the address is invalid
     &#34;&#34;&#34;
-    if not is_valid_ip(ip_addr):
+    if not _is_valid_ip(ip_addr):
         raise ValueError(f&#39;IP address must be a valid IPv4 x.x.x.x&#39;)
     if (ip_addr.startswith(&#39;10.&#39;) or
         (ip_addr.startswith(&#39;172.&#39;) and
@@ -905,39 +844,15 @@ def _get_event_loop() -&gt; tuple:
 
 def process_pcap(filename: str,
                  display_filter: str = None,
-                 queue: Queue = None,
+                 queue: multiprocessing.Queue = None,
                  debug: bool = False,
                  ) -&gt; PacketStatistics:
     &#34;&#34;&#34;Processes a PCAP file to create metrics for conversations.
 
-    To run in the background use a multiprocessing.Process and Queue:
-    ```
-    import multiprocessing
-    import queue
-
-    q = multiprocessing.Queue()
-    kwargs = {
-        &#39;filename&#39;: filename,
-        &#39;display_filter&#39;: display_filter,
-        &#39;queue&#39;: q,
-    }
-    process = multiprocessing.Process(target=process_pcap,
-                                      name=&#39;packet_capture&#39;,
-                                      kwargs=kwargs)
-    process.start()
-    while process.is_alive():
-        try:
-            while True:
-                packet_statistics = q.get(block=False)
-        except queue.Empty:
-            pass
-    process.join()
-    ```
-    
     Args:
         filename: The path/name of the PCAP file
         display_filter: An optional tshark display filter
-        queue: An optional multiprocessing Queue (e.g. required for Flask)
+        queue: An optional multiprocessing Queue
         debug: Enables pyshark debug output
     
     Returns:
@@ -950,9 +865,9 @@ def process_pcap(filename: str,
     loop_is_new = False
     if queue is not None:
         loop, loop_is_new = _get_event_loop()
-    capture = pyshark.FileCapture(input_file=file,
-                                  display_filter=display_filter,
-                                  eventloop=loop)
+    capture = FileCapture(input_file=file,
+                          display_filter=display_filter,
+                          eventloop=loop)
     capture.set_debug(debug)
     packet_number = 0
     handled_exceptions = []
@@ -977,8 +892,8 @@ def process_pcap(filename: str,
                 #:   so the last call meta is 4-deep and the call itself 3-deep
                 last_call = stack[-4:-2]
                 err_prefix = &#39;pyshark&#39;
-                if &#39;fieldedge_pcap/pcap.py&#39; in last_call[0]:
-                    err_prefix = &#39;fieldedge_pcap&#39;
+                if &#39;pcap/pyshark.py&#39; in last_call[0]:
+                    err_prefix = &#39;fieldedge-pcap&#39;
                 _log.warning(f&#39;{err_prefix} (packet {packet.number}): {err}&#39;)
                 handled_exceptions.append(str(err))
         except TSharkCrashException as err:
@@ -1008,64 +923,37 @@ def pcap_filename(duration: int, interface: str = &#39;&#39;) -&gt; str:
 
     &#34;&#34;&#34;
     dt = datetime.utcnow().isoformat().replace(&#39;-&#39;, &#39;&#39;).replace(&#39;:&#39;, &#39;&#39;)[0:15]
-    filename = f&#39;capture_{dt}_{duration}&#39; + f&#39;_{interface}&#39; if interface else &#39;&#39;
+    filename = f&#39;capture_{dt}_{duration}&#39;
+    filename += f&#39;_{interface}&#39; if interface else &#39;&#39;
     return f&#39;{filename}.pcap&#39;
 
 
 def create_pcap(interface: str = &#39;eth1&#39;,
                 duration: int = 60,
+                bpf_filter: str = None,
                 filename: str = None,
                 target_directory: str = &#39;$HOME&#39;,
-                queue: Queue = None,
+                queue: multiprocessing.Queue = None,
                 debug: bool = False,
                 **kwargs) -&gt; str:
     &#34;&#34;&#34;Creates a packet capture file of a specified interface.
 
-    A subdirectory is created in the `target_directory`, if none is specified it
-    stores to the user&#39;s home directory.
-    The subdirectory name is `capture_YYYYmmdd`.
-    The filename can be specified or `capture_YYYYmmddTHHMMSS_DDDDD.pcap`
-    format will be used.
-    To run in the background use a multiprocessing.Process and Queue:
-    ```
-    queue = multiprocessing.Queue()
-    kwargs = {
-        &#39;interface&#39;: my_interface,
-        &#39;duration&#39;: my_duration,
-        &#39;filename&#39;: pcap_filename(duration),
-        &#39;target_directory&#39;: parent_folder,
-        &#39;queue&#39;: queue,
-    }
-    capture_process = multiprocessing.Process(target=create_pcap,
-                                              name=&#39;packet_capture&#39;,
-                                              kwargs=kwargs)
-    capture_process.start()
-    capture_process.join()
-    capture_file = queue.get()
-    ```
-
-    Often times the packet capture process will result in a corrupted file or
-    have duplicate packets.
-    To check for corruption run `tshark -r &lt;capture_file&gt;` which will have a
-    returncode 2 if corrupt, and stderr will include
-    &#39;appears to have been cut short&#39;.
-    To fix a corrupted file run `editcap &lt;capture_file&gt; &lt;capture_file&gt;` which
-    should have a returncode 0.
-    
     Args:
         interface: The interface to capture from e.g. `eth1`.
         duration: The duration of the capture in seconds.
+        bpf_filter (str): A capture filter using Berkeley Packet Filter
+            (https://biot.com/capstats/bpf.html)
         target_directory: The path to save the capture to.
-        queue: An optional queue to be passed in.
-        debug: A flag to enable debug logging.
-        kwargs: may include wireshark options e.g. `capture_filter`
+        queue: If provided, filename is stored here when the
+            capture completes.
+        debug: A flag to enable pyshark debug logging.
 
     Returns:
-        The full file/path name if no event is passed in.
+        The full file/path name if no queue is passed in.
 
     &#34;&#34;&#34;
     if filename is None:
-        filename = pcap_filename(duration)
+        filename = pcap_filename(duration, interface)
     target_directory = _clean_path(target_directory)
     subdir = f&#39;{target_directory}/{filename[0:len(&#34;capture_YYYYmmdd&#34;)]}&#39;
     filepath = f&#39;{subdir}/{filename}&#39;
@@ -1075,19 +963,23 @@ def create_pcap(interface: str = &#39;eth1&#39;,
     loop_is_new = False
     if queue is not None:
         loop, loop_is_new = _get_event_loop()
-    capture = pyshark.LiveCapture(interface=interface,
-                                  output_file=filepath,
-                                  eventloop=loop,
-                                  **kwargs)
-    capture.set_debug(debug)
-    capture.sniff(timeout=duration)
-    capture.close()
-    if loop_is_new:
-        loop.close()
-    if queue is not None:
-        queue.put(filepath)
-    else:
-        return filepath</code></pre>
+    try:
+        capture = LiveCapture(interface=interface,
+                              bpf_filter=bpf_filter,
+                              output_file=filepath,
+                              eventloop=loop,
+                              **kwargs)
+        capture.set_debug(debug)
+        capture.sniff(timeout=duration)
+        capture.close()
+        if loop_is_new:
+            loop.close()
+        if queue is not None:
+            queue.put(filepath)
+        else:
+            return filepath
+    except Exception as err:
+        _log.exception(err)</code></pre>
 </details>
 </section>
 <section>
@@ -1097,114 +989,60 @@ def create_pcap(interface: str = &#39;eth1&#39;,
 <section>
 <h2 class="section-title" id="header-functions">Functions</h2>
 <dl>
-<dt id="fieldedge_pcap.pcap.create_pcap"><code class="name flex">
-<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10c26bd68>> = None, debug: bool = False, **kwargs) ‑> str</span>
+<dt id="fieldedge_pcap.pyshark.create_pcap"><code class="name flex">
+<span>def <span class="ident">create_pcap</span></span>(<span>interface: str = 'eth1', duration: int = 60, bpf_filter: str = None, filename: str = None, target_directory: str = '$HOME', queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10a61c908>> = None, debug: bool = False, **kwargs) ‑> str</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Creates a packet capture file of a specified interface.</p>
-<p>A subdirectory is created in the <code>target_directory</code>, if none is specified it
-stores to the user's home directory.
-The subdirectory name is <code>capture_YYYYmmdd</code>.
-The filename can be specified or <code>capture_YYYYmmddTHHMMSS_DDDDD.pcap</code>
-format will be used.
-To run in the background use a multiprocessing.Process and Queue:</p>
-<pre><code>queue = multiprocessing.Queue()
-kwargs = {
-    'interface': my_interface,
-    'duration': my_duration,
-    'filename': pcap_filename(duration),
-    'target_directory': parent_folder,
-    'queue': queue,
-}
-capture_process = multiprocessing.Process(target=create_pcap,
-                                          name='packet_capture',
-                                          kwargs=kwargs)
-capture_process.start()
-capture_process.join()
-capture_file = queue.get()
-</code></pre>
-<p>Often times the packet capture process will result in a corrupted file or
-have duplicate packets.
-To check for corruption run <code>tshark -r &lt;capture_file&gt;</code> which will have a
-returncode 2 if corrupt, and stderr will include
-'appears to have been cut short'.
-To fix a corrupted file run <code>editcap &lt;capture_file&gt; &lt;capture_file&gt;</code> which
-should have a returncode 0.</p>
 <h2 id="args">Args</h2>
 <dl>
 <dt><strong><code>interface</code></strong></dt>
 <dd>The interface to capture from e.g. <code>eth1</code>.</dd>
 <dt><strong><code>duration</code></strong></dt>
 <dd>The duration of the capture in seconds.</dd>
+<dt><strong><code>bpf_filter</code></strong> :&ensp;<code>str</code></dt>
+<dd>A capture filter using Berkeley Packet Filter
+(<a href="https://biot.com/capstats/bpf.html">https://biot.com/capstats/bpf.html</a>)</dd>
 <dt><strong><code>target_directory</code></strong></dt>
 <dd>The path to save the capture to.</dd>
 <dt><strong><code>queue</code></strong></dt>
-<dd>An optional queue to be passed in.</dd>
+<dd>If provided, filename is stored here when the
+capture completes.</dd>
 <dt><strong><code>debug</code></strong></dt>
-<dd>A flag to enable debug logging.</dd>
-<dt><strong><code>kwargs</code></strong></dt>
-<dd>may include wireshark options e.g. <code>capture_filter</code></dd>
+<dd>A flag to enable pyshark debug logging.</dd>
 </dl>
 <h2 id="returns">Returns</h2>
-<p>The full file/path name if no event is passed in.</p></div>
+<p>The full file/path name if no queue is passed in.</p></div>
 <details class="source">
 <summary>
 <span>Expand source code</span>
 </summary>
 <pre><code class="python">def create_pcap(interface: str = &#39;eth1&#39;,
                 duration: int = 60,
+                bpf_filter: str = None,
                 filename: str = None,
                 target_directory: str = &#39;$HOME&#39;,
-                queue: Queue = None,
+                queue: multiprocessing.Queue = None,
                 debug: bool = False,
                 **kwargs) -&gt; str:
     &#34;&#34;&#34;Creates a packet capture file of a specified interface.
 
-    A subdirectory is created in the `target_directory`, if none is specified it
-    stores to the user&#39;s home directory.
-    The subdirectory name is `capture_YYYYmmdd`.
-    The filename can be specified or `capture_YYYYmmddTHHMMSS_DDDDD.pcap`
-    format will be used.
-    To run in the background use a multiprocessing.Process and Queue:
-    ```
-    queue = multiprocessing.Queue()
-    kwargs = {
-        &#39;interface&#39;: my_interface,
-        &#39;duration&#39;: my_duration,
-        &#39;filename&#39;: pcap_filename(duration),
-        &#39;target_directory&#39;: parent_folder,
-        &#39;queue&#39;: queue,
-    }
-    capture_process = multiprocessing.Process(target=create_pcap,
-                                              name=&#39;packet_capture&#39;,
-                                              kwargs=kwargs)
-    capture_process.start()
-    capture_process.join()
-    capture_file = queue.get()
-    ```
-
-    Often times the packet capture process will result in a corrupted file or
-    have duplicate packets.
-    To check for corruption run `tshark -r &lt;capture_file&gt;` which will have a
-    returncode 2 if corrupt, and stderr will include
-    &#39;appears to have been cut short&#39;.
-    To fix a corrupted file run `editcap &lt;capture_file&gt; &lt;capture_file&gt;` which
-    should have a returncode 0.
-    
     Args:
         interface: The interface to capture from e.g. `eth1`.
         duration: The duration of the capture in seconds.
+        bpf_filter (str): A capture filter using Berkeley Packet Filter
+            (https://biot.com/capstats/bpf.html)
         target_directory: The path to save the capture to.
-        queue: An optional queue to be passed in.
-        debug: A flag to enable debug logging.
-        kwargs: may include wireshark options e.g. `capture_filter`
+        queue: If provided, filename is stored here when the
+            capture completes.
+        debug: A flag to enable pyshark debug logging.
 
     Returns:
-        The full file/path name if no event is passed in.
+        The full file/path name if no queue is passed in.
 
     &#34;&#34;&#34;
     if filename is None:
-        filename = pcap_filename(duration)
+        filename = pcap_filename(duration, interface)
     target_directory = _clean_path(target_directory)
     subdir = f&#39;{target_directory}/{filename[0:len(&#34;capture_YYYYmmdd&#34;)]}&#39;
     filepath = f&#39;{subdir}/{filename}&#39;
@@ -1214,95 +1052,26 @@ should have a returncode 0.</p>
     loop_is_new = False
     if queue is not None:
         loop, loop_is_new = _get_event_loop()
-    capture = pyshark.LiveCapture(interface=interface,
-                                  output_file=filepath,
-                                  eventloop=loop,
-                                  **kwargs)
-    capture.set_debug(debug)
-    capture.sniff(timeout=duration)
-    capture.close()
-    if loop_is_new:
-        loop.close()
-    if queue is not None:
-        queue.put(filepath)
-    else:
-        return filepath</code></pre>
+    try:
+        capture = LiveCapture(interface=interface,
+                              bpf_filter=bpf_filter,
+                              output_file=filepath,
+                              eventloop=loop,
+                              **kwargs)
+        capture.set_debug(debug)
+        capture.sniff(timeout=duration)
+        capture.close()
+        if loop_is_new:
+            loop.close()
+        if queue is not None:
+            queue.put(filepath)
+        else:
+            return filepath
+    except Exception as err:
+        _log.exception(err)</code></pre>
 </details>
 </dd>
-<dt id="fieldedge_pcap.pcap.is_private_ip"><code class="name flex">
-<span>def <span class="ident">is_private_ip</span></span>(<span>ip_addr: str) ‑> bool</span>
-</code></dt>
-<dd>
-<div class="desc"><p>Returns true if the IPv4 address is in the private range.</p>
-<h2 id="args">Args</h2>
-<dl>
-<dt><strong><code>ip_addr</code></strong></dt>
-<dd>The IP address being qualified</dd>
-</dl>
-<h2 id="returns">Returns</h2>
-<p>True if the address is in the private range(s)</p>
-<h2 id="raises">Raises</h2>
-<p>ValueError if the address is invalid</p></div>
-<details class="source">
-<summary>
-<span>Expand source code</span>
-</summary>
-<pre><code class="python">def is_private_ip(ip_addr: str) -&gt; bool:
-    &#34;&#34;&#34;Returns true if the IPv4 address is in the private range.
-    
-    Args:
-        ip_addr: The IP address being qualified
-    
-    Returns:
-        True if the address is in the private range(s)
-    
-    Raises:
-        ValueError if the address is invalid
-    &#34;&#34;&#34;
-    if not is_valid_ip(ip_addr):
-        raise ValueError(f&#39;IP address must be a valid IPv4 x.x.x.x&#39;)
-    if (ip_addr.startswith(&#39;10.&#39;) or
-        (ip_addr.startswith(&#39;172.&#39;) and
-        int(ip_addr.split(&#39;.&#39;)[1]) in range(16, 32)) or
-        ip_addr.startswith(&#39;192.168.&#39;)):
-        return True
-    return False</code></pre>
-</details>
-</dd>
-<dt id="fieldedge_pcap.pcap.is_valid_ip"><code class="name flex">
-<span>def <span class="ident">is_valid_ip</span></span>(<span>ip_addr: str) ‑> bool</span>
-</code></dt>
-<dd>
-<div class="desc"><p>Returns true if the string represents a valid IPv4 address.</p>
-<h2 id="args">Args</h2>
-<dl>
-<dt><strong><code>ip_addr</code></strong></dt>
-<dd>The IP address being qualified</dd>
-</dl>
-<h2 id="returns">Returns</h2>
-<p>True if it has 4 parts separated by <code>.</code> with each part in range 0..255</p></div>
-<details class="source">
-<summary>
-<span>Expand source code</span>
-</summary>
-<pre><code class="python">def is_valid_ip(ip_addr: str) -&gt; bool:
-    &#34;&#34;&#34;Returns true if the string represents a valid IPv4 address.
-    
-    Args:
-        ip_addr: The IP address being qualified
-    
-    Returns:
-        True if it has 4 parts separated by `.` with each part in range 0..255
-    &#34;&#34;&#34;
-    if not(isinstance(ip_addr, str)):
-        return False
-    if (len(ip_addr.split(&#39;.&#39;)) == 4 and
-        (int(x) in range (0,256) for x in ip_addr.split(&#39;.&#39;))):
-        return True
-    return False</code></pre>
-</details>
-</dd>
-<dt id="fieldedge_pcap.pcap.pcap_filename"><code class="name flex">
+<dt id="fieldedge_pcap.pyshark.pcap_filename"><code class="name flex">
 <span>def <span class="ident">pcap_filename</span></span>(<span>duration: int, interface: str = '') ‑> str</span>
 </code></dt>
 <dd>
@@ -1324,37 +1093,16 @@ should have a returncode 0.</p>
 
     &#34;&#34;&#34;
     dt = datetime.utcnow().isoformat().replace(&#39;-&#39;, &#39;&#39;).replace(&#39;:&#39;, &#39;&#39;)[0:15]
-    filename = f&#39;capture_{dt}_{duration}&#39; + f&#39;_{interface}&#39; if interface else &#39;&#39;
+    filename = f&#39;capture_{dt}_{duration}&#39;
+    filename += f&#39;_{interface}&#39; if interface else &#39;&#39;
     return f&#39;{filename}.pcap&#39;</code></pre>
 </details>
 </dd>
-<dt id="fieldedge_pcap.pcap.process_pcap"><code class="name flex">
-<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10c26bd68>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></span>
+<dt id="fieldedge_pcap.pyshark.process_pcap"><code class="name flex">
+<span>def <span class="ident">process_pcap</span></span>(<span>filename: str, display_filter: str = None, queue: <bound method BaseContext.Queue of <multiprocessing.context.DefaultContext object at 0x10a61c908>> = None, debug: bool = False) ‑> <a title="fieldedge_pcap.pyshark.PacketStatistics" href="#fieldedge_pcap.pyshark.PacketStatistics">PacketStatistics</a></span>
 </code></dt>
 <dd>
 <div class="desc"><p>Processes a PCAP file to create metrics for conversations.</p>
-<p>To run in the background use a multiprocessing.Process and Queue:</p>
-<pre><code>import multiprocessing
-import queue
-
-q = multiprocessing.Queue()
-kwargs = {
-    'filename': filename,
-    'display_filter': display_filter,
-    'queue': q,
-}
-process = multiprocessing.Process(target=process_pcap,
-                                  name='packet_capture',
-                                  kwargs=kwargs)
-process.start()
-while process.is_alive():
-    try:
-        while True:
-            packet_statistics = q.get(block=False)
-    except queue.Empty:
-        pass
-process.join()
-</code></pre>
 <h2 id="args">Args</h2>
 <dl>
 <dt><strong><code>filename</code></strong></dt>
@@ -1362,7 +1110,7 @@ process.join()
 <dt><strong><code>display_filter</code></strong></dt>
 <dd>An optional tshark display filter</dd>
 <dt><strong><code>queue</code></strong></dt>
-<dd>An optional multiprocessing Queue (e.g. required for Flask)</dd>
+<dd>An optional multiprocessing Queue</dd>
 <dt><strong><code>debug</code></strong></dt>
 <dd>Enables pyshark debug output</dd>
 </dl>
@@ -1374,39 +1122,15 @@ process.join()
 </summary>
 <pre><code class="python">def process_pcap(filename: str,
                  display_filter: str = None,
-                 queue: Queue = None,
+                 queue: multiprocessing.Queue = None,
                  debug: bool = False,
                  ) -&gt; PacketStatistics:
     &#34;&#34;&#34;Processes a PCAP file to create metrics for conversations.
 
-    To run in the background use a multiprocessing.Process and Queue:
-    ```
-    import multiprocessing
-    import queue
-
-    q = multiprocessing.Queue()
-    kwargs = {
-        &#39;filename&#39;: filename,
-        &#39;display_filter&#39;: display_filter,
-        &#39;queue&#39;: q,
-    }
-    process = multiprocessing.Process(target=process_pcap,
-                                      name=&#39;packet_capture&#39;,
-                                      kwargs=kwargs)
-    process.start()
-    while process.is_alive():
-        try:
-            while True:
-                packet_statistics = q.get(block=False)
-        except queue.Empty:
-            pass
-    process.join()
-    ```
-    
     Args:
         filename: The path/name of the PCAP file
         display_filter: An optional tshark display filter
-        queue: An optional multiprocessing Queue (e.g. required for Flask)
+        queue: An optional multiprocessing Queue
         debug: Enables pyshark debug output
     
     Returns:
@@ -1419,9 +1143,9 @@ process.join()
     loop_is_new = False
     if queue is not None:
         loop, loop_is_new = _get_event_loop()
-    capture = pyshark.FileCapture(input_file=file,
-                                  display_filter=display_filter,
-                                  eventloop=loop)
+    capture = FileCapture(input_file=file,
+                          display_filter=display_filter,
+                          eventloop=loop)
     capture.set_debug(debug)
     packet_number = 0
     handled_exceptions = []
@@ -1446,8 +1170,8 @@ process.join()
                 #:   so the last call meta is 4-deep and the call itself 3-deep
                 last_call = stack[-4:-2]
                 err_prefix = &#39;pyshark&#39;
-                if &#39;fieldedge_pcap/pcap.py&#39; in last_call[0]:
-                    err_prefix = &#39;fieldedge_pcap&#39;
+                if &#39;pcap/pyshark.py&#39; in last_call[0]:
+                    err_prefix = &#39;fieldedge-pcap&#39;
                 _log.warning(f&#39;{err_prefix} (packet {packet.number}): {err}&#39;)
                 handled_exceptions.append(str(err))
         except TSharkCrashException as err:
@@ -1472,7 +1196,7 @@ process.join()
 <section>
 <h2 class="section-title" id="header-classes">Classes</h2>
 <dl>
-<dt id="fieldedge_pcap.pcap.Conversation"><code class="flex name class">
+<dt id="fieldedge_pcap.pyshark.Conversation"><code class="flex name class">
 <span>class <span class="ident">Conversation</span></span>
 <span>(</span><span>packet: pyshark.packet.packet.Packet = None, number: int = None)</span>
 </code></dt>
@@ -1780,7 +1504,7 @@ process.join()
 </details>
 <h3>Methods</h3>
 <dl>
-<dt id="fieldedge_pcap.pcap.Conversation.data_series_packet_size"><code class="name flex">
+<dt id="fieldedge_pcap.pyshark.Conversation.data_series_packet_size"><code class="name flex">
 <span>def <span class="ident">data_series_packet_size</span></span>(<span>self) ‑> list</span>
 </code></dt>
 <dd>
@@ -1808,7 +1532,7 @@ process.join()
     return series</code></pre>
 </details>
 </dd>
-<dt id="fieldedge_pcap.pcap.Conversation.data_series_packet_size_good_bad"><code class="name flex">
+<dt id="fieldedge_pcap.pyshark.Conversation.data_series_packet_size_good_bad"><code class="name flex">
 <span>def <span class="ident">data_series_packet_size_good_bad</span></span>(<span>self) ‑> tuple[list, list]</span>
 </code></dt>
 <dd>
@@ -1829,7 +1553,7 @@ process.join()
     return (good_series, bad_series)</code></pre>
 </details>
 </dd>
-<dt id="fieldedge_pcap.pcap.Conversation.group_packets_by_size"><code class="name flex">
+<dt id="fieldedge_pcap.pyshark.Conversation.group_packets_by_size"><code class="name flex">
 <span>def <span class="ident">group_packets_by_size</span></span>(<span>self) ‑> tuple</span>
 </code></dt>
 <dd>
@@ -1867,7 +1591,7 @@ is a list of the packets of that size.</p></div>
     return (packets_a_b, packets_b_a)</code></pre>
 </details>
 </dd>
-<dt id="fieldedge_pcap.pcap.Conversation.intervals"><code class="name flex">
+<dt id="fieldedge_pcap.pyshark.Conversation.intervals"><code class="name flex">
 <span>def <span class="ident">intervals</span></span>(<span>self) ‑> dict</span>
 </code></dt>
 <dd>
@@ -1907,7 +1631,7 @@ average repeat interval B to A in seconds</p></div>
     }</code></pre>
 </details>
 </dd>
-<dt id="fieldedge_pcap.pcap.Conversation.is_packet_in_flow"><code class="name flex">
+<dt id="fieldedge_pcap.pyshark.Conversation.is_packet_in_flow"><code class="name flex">
 <span>def <span class="ident">is_packet_in_flow</span></span>(<span>self, packet: pyshark.packet.packet.Packet) ‑> bool</span>
 </code></dt>
 <dd>
@@ -1953,7 +1677,7 @@ average repeat interval B to A in seconds</p></div>
     return False</code></pre>
 </details>
 </dd>
-<dt id="fieldedge_pcap.pcap.Conversation.packet_add"><code class="name flex">
+<dt id="fieldedge_pcap.pyshark.Conversation.packet_add"><code class="name flex">
 <span>def <span class="ident">packet_add</span></span>(<span>self, packet: pyshark.packet.packet.Packet) ‑> bool</span>
 </code></dt>
 <dd>
@@ -2053,320 +1777,7 @@ different transport or stream ID than the conversation.</p></div>
 </dd>
 </dl>
 </dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol"><code class="flex name class">
-<span>class <span class="ident">EthernetProtocol</span></span>
-<span>(</span><span>value, names=None, *, module=None, qualname=None, type=None, start=1)</span>
-</code></dt>
-<dd>
-<div class="desc"><p>Mappings for Ethernet packet types.</p></div>
-<details class="source">
-<summary>
-<span>Expand source code</span>
-</summary>
-<pre><code class="python">class EthernetProtocol(Enum):
-    &#34;&#34;&#34;Mappings for Ethernet packet types.&#34;&#34;&#34;
-    ETH_TYPE_EDP = 0x00bb  # Extreme Networks Discovery Protocol
-    ETH_TYPE_PUP = 0x0200  # PUP protocol
-    ETH_TYPE_IP = 0x0800  # IP protocol
-    ETH_TYPE_ARP = 0x0806  # address resolution protocol
-    ETH_TYPE_AOE = 0x88a2  # AoE protocol
-    ETH_TYPE_CDP = 0x2000  # Cisco Discovery Protocol
-    ETH_TYPE_DTP = 0x2004  # Cisco Dynamic Trunking Protocol
-    ETH_TYPE_REVARP = 0x8035  # reverse addr resolution protocol
-    ETH_TYPE_8021Q = 0x8100  # IEEE 802.1Q VLAN tagging
-    ETH_TYPE_8021AD = 0x88a8  # IEEE 802.1ad
-    ETH_TYPE_QINQ1 = 0x9100  # Legacy QinQ
-    ETH_TYPE_QINQ2 = 0x9200  # Legacy QinQ
-    ETH_TYPE_IPX = 0x8137  # Internetwork Packet Exchange
-    ETH_TYPE_IP6 = 0x86DD  # IPv6 protocol
-    ETH_TYPE_PPP = 0x880B  # PPP
-    ETH_TYPE_MPLS = 0x8847  # MPLS
-    ETH_TYPE_MPLS_MCAST = 0x8848  # MPLS Multicast
-    ETH_TYPE_PPPOE_DISC = 0x8863  # PPP Over Ethernet Discovery Stage
-    ETH_TYPE_PPPOE = 0x8864  # PPP Over Ethernet Session Stage
-    ETH_TYPE_LLDP = 0x88CC  # Link Layer Discovery Protocol
-    ETH_TYPE_TEB = 0x6558  # Transparent Ethernet Bridging</code></pre>
-</details>
-<h3>Ancestors</h3>
-<ul class="hlist">
-<li>enum.Enum</li>
-</ul>
-<h3>Class variables</h3>
-<dl>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_8021AD"><code class="name">var <span class="ident">ETH_TYPE_8021AD</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_8021Q"><code class="name">var <span class="ident">ETH_TYPE_8021Q</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_AOE"><code class="name">var <span class="ident">ETH_TYPE_AOE</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_ARP"><code class="name">var <span class="ident">ETH_TYPE_ARP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_CDP"><code class="name">var <span class="ident">ETH_TYPE_CDP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_DTP"><code class="name">var <span class="ident">ETH_TYPE_DTP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_EDP"><code class="name">var <span class="ident">ETH_TYPE_EDP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_IP"><code class="name">var <span class="ident">ETH_TYPE_IP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_IP6"><code class="name">var <span class="ident">ETH_TYPE_IP6</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_IPX"><code class="name">var <span class="ident">ETH_TYPE_IPX</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_LLDP"><code class="name">var <span class="ident">ETH_TYPE_LLDP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_MPLS"><code class="name">var <span class="ident">ETH_TYPE_MPLS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_MPLS_MCAST"><code class="name">var <span class="ident">ETH_TYPE_MPLS_MCAST</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_PPP"><code class="name">var <span class="ident">ETH_TYPE_PPP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_PPPOE"><code class="name">var <span class="ident">ETH_TYPE_PPPOE</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_PPPOE_DISC"><code class="name">var <span class="ident">ETH_TYPE_PPPOE_DISC</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_PUP"><code class="name">var <span class="ident">ETH_TYPE_PUP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_QINQ1"><code class="name">var <span class="ident">ETH_TYPE_QINQ1</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_QINQ2"><code class="name">var <span class="ident">ETH_TYPE_QINQ2</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_REVARP"><code class="name">var <span class="ident">ETH_TYPE_REVARP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_TEB"><code class="name">var <span class="ident">ETH_TYPE_TEB</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-</dl>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts"><code class="flex name class">
-<span>class <span class="ident">KnownTcpPorts</span></span>
-<span>(</span><span>value, names=None, *, module=None, qualname=None, type=None, start=1)</span>
-</code></dt>
-<dd>
-<div class="desc"><p>Mappings for common registered/known application layer TCP ports.</p></div>
-<details class="source">
-<summary>
-<span>Expand source code</span>
-</summary>
-<pre><code class="python">class KnownTcpPorts(Enum):
-    &#34;&#34;&#34;Mappings for common registered/known application layer TCP ports.&#34;&#34;&#34;
-    SMTP = 25
-    HTTP = 80
-    HTTP_TLS = 443
-    DNS = 53
-    FTP = 20
-    FTPC = 21
-    TELNET = 23
-    IMAP = 143
-    RDP = 3389
-    SSH = 22
-    HTTP2 = 8080
-    MODBUS = 502
-    MODBUS_TLS = 802
-    MQTT = 1883
-    MQTT_TLS = 8883
-    MQTT_SOCKET = 9001
-    DOCKERAPI = 2375
-    DOCKERAPI_TLS = 2376
-    SRCP = 4303
-    COAP = 5683
-    COAP_TLS = 5684
-    DNP2 = 19999
-    DNP = 20000
-    IEC60870 = 2404</code></pre>
-</details>
-<h3>Ancestors</h3>
-<ul class="hlist">
-<li>enum.Enum</li>
-</ul>
-<h3>Class variables</h3>
-<dl>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.COAP"><code class="name">var <span class="ident">COAP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.COAP_TLS"><code class="name">var <span class="ident">COAP_TLS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.DNP"><code class="name">var <span class="ident">DNP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.DNP2"><code class="name">var <span class="ident">DNP2</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.DNS"><code class="name">var <span class="ident">DNS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI"><code class="name">var <span class="ident">DOCKERAPI</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI_TLS"><code class="name">var <span class="ident">DOCKERAPI_TLS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.FTP"><code class="name">var <span class="ident">FTP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.FTPC"><code class="name">var <span class="ident">FTPC</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.HTTP"><code class="name">var <span class="ident">HTTP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.HTTP2"><code class="name">var <span class="ident">HTTP2</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.HTTP_TLS"><code class="name">var <span class="ident">HTTP_TLS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.IEC60870"><code class="name">var <span class="ident">IEC60870</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.IMAP"><code class="name">var <span class="ident">IMAP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.MODBUS"><code class="name">var <span class="ident">MODBUS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.MODBUS_TLS"><code class="name">var <span class="ident">MODBUS_TLS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.MQTT"><code class="name">var <span class="ident">MQTT</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.MQTT_SOCKET"><code class="name">var <span class="ident">MQTT_SOCKET</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.MQTT_TLS"><code class="name">var <span class="ident">MQTT_TLS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.RDP"><code class="name">var <span class="ident">RDP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.SMTP"><code class="name">var <span class="ident">SMTP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.SRCP"><code class="name">var <span class="ident">SRCP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.SSH"><code class="name">var <span class="ident">SSH</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownTcpPorts.TELNET"><code class="name">var <span class="ident">TELNET</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-</dl>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownUdpPorts"><code class="flex name class">
-<span>class <span class="ident">KnownUdpPorts</span></span>
-<span>(</span><span>value, names=None, *, module=None, qualname=None, type=None, start=1)</span>
-</code></dt>
-<dd>
-<div class="desc"><p>Mappings for common registered/known application layer TCP ports.</p></div>
-<details class="source">
-<summary>
-<span>Expand source code</span>
-</summary>
-<pre><code class="python">class KnownUdpPorts(Enum):
-    &#34;&#34;&#34;Mappings for common registered/known application layer TCP ports.&#34;&#34;&#34;
-    SNMP = 161
-    DNS = 53
-    DHCP_QUERY = 67
-    DHCP_RESPONSE = 68
-    NTP = 123</code></pre>
-</details>
-<h3>Ancestors</h3>
-<ul class="hlist">
-<li>enum.Enum</li>
-</ul>
-<h3>Class variables</h3>
-<dl>
-<dt id="fieldedge_pcap.pcap.KnownUdpPorts.DHCP_QUERY"><code class="name">var <span class="ident">DHCP_QUERY</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownUdpPorts.DHCP_RESPONSE"><code class="name">var <span class="ident">DHCP_RESPONSE</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownUdpPorts.DNS"><code class="name">var <span class="ident">DNS</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownUdpPorts.NTP"><code class="name">var <span class="ident">NTP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-<dt id="fieldedge_pcap.pcap.KnownUdpPorts.SNMP"><code class="name">var <span class="ident">SNMP</span></code></dt>
-<dd>
-<div class="desc"></div>
-</dd>
-</dl>
-</dd>
-<dt id="fieldedge_pcap.pcap.PacketStatistics"><code class="flex name class">
+<dt id="fieldedge_pcap.pyshark.PacketStatistics"><code class="flex name class">
 <span>class <span class="ident">PacketStatistics</span></span>
 <span>(</span><span>source_filename: str = None)</span>
 </code></dt>
@@ -2599,7 +2010,7 @@ different transport or stream ID than the conversation.</p></div>
 </details>
 <h3>Instance variables</h3>
 <dl>
-<dt id="fieldedge_pcap.pcap.PacketStatistics.bytes_total"><code class="name">var <span class="ident">bytes_total</span> : int</code></dt>
+<dt id="fieldedge_pcap.pyshark.PacketStatistics.bytes_total"><code class="name">var <span class="ident">bytes_total</span> : int</code></dt>
 <dd>
 <div class="desc"></div>
 <details class="source">
@@ -2611,7 +2022,7 @@ def bytes_total(self) -&gt; int:
     return self._bytes_total</code></pre>
 </details>
 </dd>
-<dt id="fieldedge_pcap.pcap.PacketStatistics.duration"><code class="name">var <span class="ident">duration</span> : int</code></dt>
+<dt id="fieldedge_pcap.pyshark.PacketStatistics.duration"><code class="name">var <span class="ident">duration</span> : int</code></dt>
 <dd>
 <div class="desc"></div>
 <details class="source">
@@ -2631,7 +2042,7 @@ def duration(self) -&gt; int:
     return duration</code></pre>
 </details>
 </dd>
-<dt id="fieldedge_pcap.pcap.PacketStatistics.packet_count"><code class="name">var <span class="ident">packet_count</span> : int</code></dt>
+<dt id="fieldedge_pcap.pyshark.PacketStatistics.packet_count"><code class="name">var <span class="ident">packet_count</span> : int</code></dt>
 <dd>
 <div class="desc"></div>
 <details class="source">
@@ -2646,7 +2057,7 @@ def packet_count(self) -&gt; int:
 </dl>
 <h3>Methods</h3>
 <dl>
-<dt id="fieldedge_pcap.pcap.PacketStatistics.analyze_conversations"><code class="name flex">
+<dt id="fieldedge_pcap.pyshark.PacketStatistics.analyze_conversations"><code class="name flex">
 <span>def <span class="ident">analyze_conversations</span></span>(<span>self) ‑> dict</span>
 </code></dt>
 <dd>
@@ -2742,7 +2153,7 @@ repeat_stdev: <code>int</code>
     return results</code></pre>
 </details>
 </dd>
-<dt id="fieldedge_pcap.pcap.PacketStatistics.data_series_application_size"><code class="name flex">
+<dt id="fieldedge_pcap.pyshark.PacketStatistics.data_series_application_size"><code class="name flex">
 <span>def <span class="ident">data_series_application_size</span></span>(<span>self, split_bad: bool = False) ‑> dict</span>
 </code></dt>
 <dd>
@@ -2785,7 +2196,7 @@ tuples with (unix_timestamp, size_in_bytes)</p></div>
     return multi_series</code></pre>
 </details>
 </dd>
-<dt id="fieldedge_pcap.pcap.PacketStatistics.packet_add"><code class="name flex">
+<dt id="fieldedge_pcap.pyshark.PacketStatistics.packet_add"><code class="name flex">
 <span>def <span class="ident">packet_add</span></span>(<span>self, packet: pyshark.packet.packet.Packet) ‑> None</span>
 </code></dt>
 <dd>
@@ -2822,7 +2233,7 @@ tuples with (unix_timestamp, size_in_bytes)</p></div>
         self._process_unhandled(packet)</code></pre>
 </details>
 </dd>
-<dt id="fieldedge_pcap.pcap.PacketStatistics.unique_host_pairs"><code class="name flex">
+<dt id="fieldedge_pcap.pyshark.PacketStatistics.unique_host_pairs"><code class="name flex">
 <span>def <span class="ident">unique_host_pairs</span></span>(<span>self) ‑> list[tuple]</span>
 </code></dt>
 <dd>
@@ -2842,7 +2253,7 @@ tuples with (unix_timestamp, size_in_bytes)</p></div>
 </dd>
 </dl>
 </dd>
-<dt id="fieldedge_pcap.pcap.SimplePacket"><code class="flex name class">
+<dt id="fieldedge_pcap.pyshark.SimplePacket"><code class="flex name class">
 <span>class <span class="ident">SimplePacket</span></span>
 <span>(</span><span>packet: pyshark.packet.packet.Packet, parent_hosts: tuple)</span>
 </code></dt>
@@ -2932,105 +2343,38 @@ tuples with (unix_timestamp, size_in_bytes)</p></div>
 </li>
 <li><h3><a href="#header-functions">Functions</a></h3>
 <ul class="">
-<li><code><a title="fieldedge_pcap.pcap.create_pcap" href="#fieldedge_pcap.pcap.create_pcap">create_pcap</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.is_private_ip" href="#fieldedge_pcap.pcap.is_private_ip">is_private_ip</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.is_valid_ip" href="#fieldedge_pcap.pcap.is_valid_ip">is_valid_ip</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.pcap_filename" href="#fieldedge_pcap.pcap.pcap_filename">pcap_filename</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.process_pcap" href="#fieldedge_pcap.pcap.process_pcap">process_pcap</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.create_pcap" href="#fieldedge_pcap.pyshark.create_pcap">create_pcap</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.pcap_filename" href="#fieldedge_pcap.pyshark.pcap_filename">pcap_filename</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.process_pcap" href="#fieldedge_pcap.pyshark.process_pcap">process_pcap</a></code></li>
 </ul>
 </li>
 <li><h3><a href="#header-classes">Classes</a></h3>
 <ul>
 <li>
-<h4><code><a title="fieldedge_pcap.pcap.Conversation" href="#fieldedge_pcap.pcap.Conversation">Conversation</a></code></h4>
+<h4><code><a title="fieldedge_pcap.pyshark.Conversation" href="#fieldedge_pcap.pyshark.Conversation">Conversation</a></code></h4>
 <ul class="">
-<li><code><a title="fieldedge_pcap.pcap.Conversation.data_series_packet_size" href="#fieldedge_pcap.pcap.Conversation.data_series_packet_size">data_series_packet_size</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.Conversation.data_series_packet_size_good_bad" href="#fieldedge_pcap.pcap.Conversation.data_series_packet_size_good_bad">data_series_packet_size_good_bad</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.Conversation.group_packets_by_size" href="#fieldedge_pcap.pcap.Conversation.group_packets_by_size">group_packets_by_size</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.Conversation.intervals" href="#fieldedge_pcap.pcap.Conversation.intervals">intervals</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.Conversation.is_packet_in_flow" href="#fieldedge_pcap.pcap.Conversation.is_packet_in_flow">is_packet_in_flow</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.Conversation.packet_add" href="#fieldedge_pcap.pcap.Conversation.packet_add">packet_add</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.Conversation.data_series_packet_size" href="#fieldedge_pcap.pyshark.Conversation.data_series_packet_size">data_series_packet_size</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.Conversation.data_series_packet_size_good_bad" href="#fieldedge_pcap.pyshark.Conversation.data_series_packet_size_good_bad">data_series_packet_size_good_bad</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.Conversation.group_packets_by_size" href="#fieldedge_pcap.pyshark.Conversation.group_packets_by_size">group_packets_by_size</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.Conversation.intervals" href="#fieldedge_pcap.pyshark.Conversation.intervals">intervals</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.Conversation.is_packet_in_flow" href="#fieldedge_pcap.pyshark.Conversation.is_packet_in_flow">is_packet_in_flow</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.Conversation.packet_add" href="#fieldedge_pcap.pyshark.Conversation.packet_add">packet_add</a></code></li>
 </ul>
 </li>
 <li>
-<h4><code><a title="fieldedge_pcap.pcap.EthernetProtocol" href="#fieldedge_pcap.pcap.EthernetProtocol">EthernetProtocol</a></code></h4>
-<ul class="two-column">
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_8021AD" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_8021AD">ETH_TYPE_8021AD</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_8021Q" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_8021Q">ETH_TYPE_8021Q</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_AOE" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_AOE">ETH_TYPE_AOE</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_ARP" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_ARP">ETH_TYPE_ARP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_CDP" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_CDP">ETH_TYPE_CDP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_DTP" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_DTP">ETH_TYPE_DTP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_EDP" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_EDP">ETH_TYPE_EDP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_IP" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_IP">ETH_TYPE_IP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_IP6" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_IP6">ETH_TYPE_IP6</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_IPX" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_IPX">ETH_TYPE_IPX</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_LLDP" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_LLDP">ETH_TYPE_LLDP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_MPLS" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_MPLS">ETH_TYPE_MPLS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_MPLS_MCAST" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_MPLS_MCAST">ETH_TYPE_MPLS_MCAST</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_PPP" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_PPP">ETH_TYPE_PPP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_PPPOE" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_PPPOE">ETH_TYPE_PPPOE</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_PPPOE_DISC" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_PPPOE_DISC">ETH_TYPE_PPPOE_DISC</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_PUP" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_PUP">ETH_TYPE_PUP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_QINQ1" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_QINQ1">ETH_TYPE_QINQ1</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_QINQ2" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_QINQ2">ETH_TYPE_QINQ2</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_REVARP" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_REVARP">ETH_TYPE_REVARP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_TEB" href="#fieldedge_pcap.pcap.EthernetProtocol.ETH_TYPE_TEB">ETH_TYPE_TEB</a></code></li>
-</ul>
-</li>
-<li>
-<h4><code><a title="fieldedge_pcap.pcap.KnownTcpPorts" href="#fieldedge_pcap.pcap.KnownTcpPorts">KnownTcpPorts</a></code></h4>
-<ul class="two-column">
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.COAP" href="#fieldedge_pcap.pcap.KnownTcpPorts.COAP">COAP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.COAP_TLS" href="#fieldedge_pcap.pcap.KnownTcpPorts.COAP_TLS">COAP_TLS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DNP" href="#fieldedge_pcap.pcap.KnownTcpPorts.DNP">DNP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DNP2" href="#fieldedge_pcap.pcap.KnownTcpPorts.DNP2">DNP2</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DNS" href="#fieldedge_pcap.pcap.KnownTcpPorts.DNS">DNS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI" href="#fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI">DOCKERAPI</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI_TLS" href="#fieldedge_pcap.pcap.KnownTcpPorts.DOCKERAPI_TLS">DOCKERAPI_TLS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.FTP" href="#fieldedge_pcap.pcap.KnownTcpPorts.FTP">FTP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.FTPC" href="#fieldedge_pcap.pcap.KnownTcpPorts.FTPC">FTPC</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.HTTP" href="#fieldedge_pcap.pcap.KnownTcpPorts.HTTP">HTTP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.HTTP2" href="#fieldedge_pcap.pcap.KnownTcpPorts.HTTP2">HTTP2</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.HTTP_TLS" href="#fieldedge_pcap.pcap.KnownTcpPorts.HTTP_TLS">HTTP_TLS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.IEC60870" href="#fieldedge_pcap.pcap.KnownTcpPorts.IEC60870">IEC60870</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.IMAP" href="#fieldedge_pcap.pcap.KnownTcpPorts.IMAP">IMAP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.MODBUS" href="#fieldedge_pcap.pcap.KnownTcpPorts.MODBUS">MODBUS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.MODBUS_TLS" href="#fieldedge_pcap.pcap.KnownTcpPorts.MODBUS_TLS">MODBUS_TLS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.MQTT" href="#fieldedge_pcap.pcap.KnownTcpPorts.MQTT">MQTT</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.MQTT_SOCKET" href="#fieldedge_pcap.pcap.KnownTcpPorts.MQTT_SOCKET">MQTT_SOCKET</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.MQTT_TLS" href="#fieldedge_pcap.pcap.KnownTcpPorts.MQTT_TLS">MQTT_TLS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.RDP" href="#fieldedge_pcap.pcap.KnownTcpPorts.RDP">RDP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.SMTP" href="#fieldedge_pcap.pcap.KnownTcpPorts.SMTP">SMTP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.SRCP" href="#fieldedge_pcap.pcap.KnownTcpPorts.SRCP">SRCP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.SSH" href="#fieldedge_pcap.pcap.KnownTcpPorts.SSH">SSH</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownTcpPorts.TELNET" href="#fieldedge_pcap.pcap.KnownTcpPorts.TELNET">TELNET</a></code></li>
-</ul>
-</li>
-<li>
-<h4><code><a title="fieldedge_pcap.pcap.KnownUdpPorts" href="#fieldedge_pcap.pcap.KnownUdpPorts">KnownUdpPorts</a></code></h4>
+<h4><code><a title="fieldedge_pcap.pyshark.PacketStatistics" href="#fieldedge_pcap.pyshark.PacketStatistics">PacketStatistics</a></code></h4>
 <ul class="">
-<li><code><a title="fieldedge_pcap.pcap.KnownUdpPorts.DHCP_QUERY" href="#fieldedge_pcap.pcap.KnownUdpPorts.DHCP_QUERY">DHCP_QUERY</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownUdpPorts.DHCP_RESPONSE" href="#fieldedge_pcap.pcap.KnownUdpPorts.DHCP_RESPONSE">DHCP_RESPONSE</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownUdpPorts.DNS" href="#fieldedge_pcap.pcap.KnownUdpPorts.DNS">DNS</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownUdpPorts.NTP" href="#fieldedge_pcap.pcap.KnownUdpPorts.NTP">NTP</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.KnownUdpPorts.SNMP" href="#fieldedge_pcap.pcap.KnownUdpPorts.SNMP">SNMP</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.PacketStatistics.analyze_conversations" href="#fieldedge_pcap.pyshark.PacketStatistics.analyze_conversations">analyze_conversations</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.PacketStatistics.bytes_total" href="#fieldedge_pcap.pyshark.PacketStatistics.bytes_total">bytes_total</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.PacketStatistics.data_series_application_size" href="#fieldedge_pcap.pyshark.PacketStatistics.data_series_application_size">data_series_application_size</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.PacketStatistics.duration" href="#fieldedge_pcap.pyshark.PacketStatistics.duration">duration</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.PacketStatistics.packet_add" href="#fieldedge_pcap.pyshark.PacketStatistics.packet_add">packet_add</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.PacketStatistics.packet_count" href="#fieldedge_pcap.pyshark.PacketStatistics.packet_count">packet_count</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark.PacketStatistics.unique_host_pairs" href="#fieldedge_pcap.pyshark.PacketStatistics.unique_host_pairs">unique_host_pairs</a></code></li>
 </ul>
 </li>
 <li>
-<h4><code><a title="fieldedge_pcap.pcap.PacketStatistics" href="#fieldedge_pcap.pcap.PacketStatistics">PacketStatistics</a></code></h4>
-<ul class="">
-<li><code><a title="fieldedge_pcap.pcap.PacketStatistics.analyze_conversations" href="#fieldedge_pcap.pcap.PacketStatistics.analyze_conversations">analyze_conversations</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.PacketStatistics.bytes_total" href="#fieldedge_pcap.pcap.PacketStatistics.bytes_total">bytes_total</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.PacketStatistics.data_series_application_size" href="#fieldedge_pcap.pcap.PacketStatistics.data_series_application_size">data_series_application_size</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.PacketStatistics.duration" href="#fieldedge_pcap.pcap.PacketStatistics.duration">duration</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.PacketStatistics.packet_add" href="#fieldedge_pcap.pcap.PacketStatistics.packet_add">packet_add</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.PacketStatistics.packet_count" href="#fieldedge_pcap.pcap.PacketStatistics.packet_count">packet_count</a></code></li>
-<li><code><a title="fieldedge_pcap.pcap.PacketStatistics.unique_host_pairs" href="#fieldedge_pcap.pcap.PacketStatistics.unique_host_pairs">unique_host_pairs</a></code></li>
-</ul>
-</li>
-<li>
-<h4><code><a title="fieldedge_pcap.pcap.SimplePacket" href="#fieldedge_pcap.pcap.SimplePacket">SimplePacket</a></code></h4>
+<h4><code><a title="fieldedge_pcap.pyshark.SimplePacket" href="#fieldedge_pcap.pyshark.SimplePacket">SimplePacket</a></code></h4>
 </li>
 </ul>
 </li>

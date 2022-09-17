@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1" />
 <meta name="generator" content="pdoc 0.10.0" />
 <title>fieldedge_pcap API documentation</title>
-<meta name="description" content="" />
+<meta name="description" content="FieldEdge Packet Capture Utility …" />
 <link rel="preload stylesheet" as="style" href="https://cdnjs.cloudflare.com/ajax/libs/10up-sanitize.css/11.0.1/sanitize.min.css" integrity="sha256-PK9q560IAAa6WVRRh76LtCaI8pjTJ2z11v0miyNNjrs=" crossorigin>
 <link rel="preload stylesheet" as="style" href="https://cdnjs.cloudflare.com/ajax/libs/10up-sanitize.css/11.0.1/typography.min.css" integrity="sha256-7l/o7C8jubJiy74VsKTidCy1yBkRtiUGbVkYBylBqUg=" crossorigin>
 <link rel="stylesheet preload" as="style" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/10.1.1/styles/github.min.css" crossorigin>
@@ -22,11 +22,139 @@
 <h1 class="title">Package <code>fieldedge_pcap</code></h1>
 </header>
 <section id="section-intro">
+<h1 id="fieldedge-packet-capture-utility">FieldEdge Packet Capture Utility</h1>
+<p>A Python library for creating and analyzing Wireshark packet captures
+based on <a href="https://github.com/KimiNewt/pyshark"><strong><code>pyshark</code></strong></a>.</p>
+<p><a href="https://inmarsat-enterprise.github.io/fieldedge-pcap/">Documentation</a></p>
+<p>This package requires <a href="https://www.wireshark.org/docs/man-pages/tshark.html"><strong>tshark</strong></a>
+to be installed on the host system.</p>
+<h2 id="usage">Usage</h2>
+<h3 id="create-a-packet-capture-file">Create a Packet Capture file</h3>
+<p>Using <strong><code><a title="fieldedge_pcap.pyshark.create_pcap" href="pyshark.html#fieldedge_pcap.pyshark.create_pcap">create_pcap()</a></code></strong>:</p>
+<p>A subdirectory is created in the <code>target_directory</code>. If none is specified it
+stores to the user's home directory.
+The subdirectory created is named <code>/capture_YYYYmmdd</code>.
+The default filename is <code>capture_YYYYmmddTHHMMSS_D_i.pcap</code> where <code>D</code> is the
+duration in seconds and <code>i</code> is the interface name. Filename may be overridden
+if provided as an argument.</p>
+<p>To run in the background use a <code>multiprocessing</code> <code>Process</code> and <code>Queue</code>:</p>
+<pre><code>import multiprocessing
+
+q = multiprocessing.Queue()
+kwargs = {
+    'interface': 'eth1',
+    'duration': 600,
+    'queue': q,
+}
+capture_process = multiprocessing.Process(target=create_pcap,
+                                          name='packet_capture',
+                                          kwargs=kwargs)
+capture_process.start()
+capture_process.join()
+capture_file = q.get()
+</code></pre>
+<p>Often times the packet capture process will result in a corrupted file or
+have duplicate packets.
+To check for corruption run <code>tshark -r &lt;capture_file&gt;</code> which will have a
+returncode 2 if corrupt, and stderr will include
+<code>appears to have been cut short</code>.
+To fix a corrupted file run <code>editcap &lt;capture_file&gt; &lt;capture_file&gt;</code> which
+should have a returncode <code>0</code>.</p>
+<h3 id="process-a-packet-capture-file">Process a Packet Capture file</h3>
+<p>Using <strong><code><a title="fieldedge_pcap.pyshark.process_pcap" href="pyshark.html#fieldedge_pcap.pyshark.process_pcap">process_pcap()</a></code></strong>:</p>
+<p>To run in the background use a <code>multiprocessing</code> <code>Process</code> and <code>Queue</code>, and
+<code>queue.Empty</code> exception for timeouts:</p>
+<pre><code>import multiprocessing
+import queue
+
+q = multiprocessing.Queue()
+kwargs = {
+    'filename': filename,
+    'display_filter': display_filter,
+    'queue': q,
+}
+process = multiprocessing.Process(target=process_pcap,
+                                    name='packet_capture',
+                                    kwargs=kwargs)
+process.start()
+while process.is_alive():
+    try:
+        while True:
+            packet_statistics = q.get(block=False)
+    except queue.Empty:
+        pass
+process.join()
+</code></pre>
+<h3 id="get-analysis-data">Get Analysis data</h3>
+<p>After a file has been processed to produce a <code>PacketStatistics</code> object, a
+typical operation is to generate simple data series based on
+procotol/application use, to display or graph.</p>
+<pre><code>data_series = packet_statistics.data_series_application_size()
+for application, series in data_series.items():
+    print(f'Application: {application}')
+    for tup in series:
+        print(f'Timestamp: {tup[0]} | Bytes: {tup[1]}')
+</code></pre>
+<p>Conversation summaries is also a typical use:</p>
+<pre><code>import json
+...
+
+convo_analysis = packet_statistics.analyze_conversations()
+for hosts, detail in convo_analysis.items():
+    print(f'Conversation {hosts}:\n{json.dumps(detail, indent=2)}')
+</code></pre>
+<p>Would return something like:</p>
+<pre><code>Conversation ('0.0.0.0', '255.255.255.255'):
+{
+  &quot;count&quot;: 1,
+  &quot;applications&quot;: [
+    &quot;UDP_DHCP_RESPONSE&quot;
+  ],
+  &quot;start_times&quot;: [
+    1642667840.985
+  ],
+  &quot;packet_intervals&quot;: {
+    &quot;AB_intervals&quot;: {
+      &quot;UDP_DHCP_RESPONSE_382B&quot;: 12.383,
+      &quot;UDP_DHCP_RESPONSE_389B&quot;: null
+    },
+    &quot;BA_intervals&quot;: {}
+  },
+  &quot;bytes&quot;: 2681,
+  &quot;bad_packet_count&quot;: 0,
+  &quot;bytes_bad&quot;: 0,
+  &quot;retransmit_count&quot;: 0,
+  &quot;retransmit_bytes&quot;: 0,
+  &quot;repeat_mean&quot;: null,
+  &quot;repeat_stdev&quot;: null
+}
+</code></pre>
+<h2 id="docker-image">Docker Image</h2>
+<p>In order to simplify packaging and distribution for use with Inmarsat's
+<strong>FieldEdge</strong> tools, a Docker image has been created targeting use on a
+<code>armv7</code> processor such as Raspberry Pi 3B+, 4 or Zero 2 W.
+To use in a
+Dockerfile add the following line:</p>
+<pre><code>FROM inmarsat/fieldedge-pyshark:latest
+...
+</code></pre>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">&#34;&#34;&#34;
+.. include:: ../README.md
+&#34;&#34;&#34;</code></pre>
+</details>
 </section>
 <section>
 <h2 class="section-title" id="header-submodules">Sub-modules</h2>
 <dl>
-<dt><code class="name"><a title="fieldedge_pcap.pcap" href="pcap.html">fieldedge_pcap.pcap</a></code></dt>
+<dt><code class="name"><a title="fieldedge_pcap.constants" href="constants.html">fieldedge_pcap.constants</a></code></dt>
+<dd>
+<div class="desc"></div>
+</dd>
+<dt><code class="name"><a title="fieldedge_pcap.pyshark" href="pyshark.html">fieldedge_pcap.pyshark</a></code></dt>
 <dd>
 <div class="desc"><p>A utility to parse and generate relevant metrics for analysis of a PCAP file …</p></div>
 </dd>
@@ -42,12 +170,24 @@
 <nav id="sidebar">
 <h1>Index</h1>
 <div class="toc">
-<ul></ul>
+<ul>
+<li><a href="#fieldedge-packet-capture-utility">FieldEdge Packet Capture Utility</a><ul>
+<li><a href="#usage">Usage</a><ul>
+<li><a href="#create-a-packet-capture-file">Create a Packet Capture file</a></li>
+<li><a href="#process-a-packet-capture-file">Process a Packet Capture file</a></li>
+<li><a href="#get-analysis-data">Get Analysis data</a></li>
+</ul>
+</li>
+<li><a href="#docker-image">Docker Image</a></li>
+</ul>
+</li>
+</ul>
 </div>
 <ul id="index">
 <li><h3><a href="#header-submodules">Sub-modules</a></h3>
 <ul>
-<li><code><a title="fieldedge_pcap.pcap" href="pcap.html">fieldedge_pcap.pcap</a></code></li>
+<li><code><a title="fieldedge_pcap.constants" href="constants.html">fieldedge_pcap.constants</a></code></li>
+<li><code><a title="fieldedge_pcap.pyshark" href="pyshark.html">fieldedge_pcap.pyshark</a></code></li>
 </ul>
 </li>
 </ul>

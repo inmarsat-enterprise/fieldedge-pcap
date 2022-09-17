@@ -1,14 +1,19 @@
+import logging
+import json
 import os
-import shutil
 import queue
+import shutil
 import subprocess
 from multiprocessing import Process, Queue
 from time import time
 
-from fieldedge_pcap import pcap
+from fieldedge_pcap import pyshark
 
 TEST_DIR = './pcaps/samples'
 TEST_INTERFACE = 'en0'
+
+_log = logging.getLogger(__name__)
+
 
 def is_corrupt(filename: str) -> bool:
     try:
@@ -42,8 +47,12 @@ def cleanup(filename: str):
 
 def test_create():
     """Creates and reads a pcap file on a local interface."""
-    filename = pcap.create_pcap(interface=TEST_INTERFACE, duration=5,
-        target_directory=TEST_DIR, debug=True)
+    filename = pyshark.create_pcap(interface=TEST_INTERFACE,
+                                duration=10,
+                                target_directory=TEST_DIR,
+                                debug=True,
+                                bpf_filter='(not arp and not udp port 1900)',
+                                )
     assert(os.path.isfile(filename))
     cleanup(filename)
 
@@ -52,30 +61,32 @@ def test_create_multiprocessing():
     queue = Queue()
     kwargs = {
         'interface': TEST_INTERFACE,
-        'duration': 5,
+        'duration': 10,
         'target_directory': TEST_DIR,
         'queue': queue,
         'debug': True,
+        'bpf_filter': None,
+        'use_ek': True,
     }
-    process = Process(target=pcap.create_pcap, kwargs=kwargs)
+    process = Process(target=pyshark.create_pcap, kwargs=kwargs)
     process.start()
     process.join()
     filename = queue.get()
     assert(os.path.isfile(filename))
     if is_corrupt(filename):
         assert fix_corrupt(filename)
-    cleanup(filename)
+    # cleanup(filename)
 
 
 def test_create_and_read_pcap():
     """Creates and reads a pcap file on a local interface."""
-    filename = pcap.create_pcap(interface=TEST_INTERFACE, duration=5,
+    filename = pyshark.create_pcap(interface=TEST_INTERFACE, duration=5,
         target_directory=TEST_DIR, debug=True)
     assert(os.path.isfile(filename))
     if is_corrupt(filename):
         assert fix_corrupt(filename)
-    packet_statistics = pcap.process_pcap(filename=filename)
-    assert(isinstance(packet_statistics, pcap.PacketStatistics))
+    packet_statistics = pyshark.process_pcap(filename=filename)
+    assert(isinstance(packet_statistics, pyshark.PacketStatistics))
     cleanup(filename)
 
 
@@ -85,16 +96,16 @@ def test_packet_statistics():
     duration = 50
     # filename = f'{TEST_DIR}/capture_20211210T173939_1800.pcap'
     # duration = 1800
-    packet_stats = pcap.process_pcap(filename=filename)
-    assert isinstance(packet_stats, pcap.PacketStatistics)
+    packet_stats = pyshark.process_pcap(filename=filename)
+    assert isinstance(packet_stats, pyshark.PacketStatistics)
     assert isinstance(packet_stats.duration, int)
     assert packet_stats.duration == duration
     assert packet_stats.packet_count > 0
     assert packet_stats.bytes_total > 0
     for conversation in packet_stats.conversations:
-        assert isinstance(conversation, pcap.Conversation)
+        assert isinstance(conversation, pyshark.Conversation)
         for simple_packet in conversation.packets:
-            assert isinstance(simple_packet, pcap.SimplePacket)
+            assert isinstance(simple_packet, pyshark.SimplePacket)
             assert isinstance(simple_packet.a_b, bool)
             assert isinstance(simple_packet.application, str)
             assert isinstance(simple_packet.highest_layer, str)
@@ -127,7 +138,7 @@ def test_process_multiprocessing():
     # filename = f'{TEST_DIR}/capture_20211205T142537_60.pcap'
     filename = f'{TEST_DIR}/capture_20211215T031635_3600.pcap'
     q = Queue()
-    process = Process(target=pcap.process_pcap, args=(filename, None, q))
+    process = Process(target=pyshark.process_pcap, args=(filename, None, q))
     starttime = time()
     process.start()
     while process.is_alive():
@@ -138,7 +149,7 @@ def test_process_multiprocessing():
             pass
     process.join()
     processing_time = time() - starttime
-    assert isinstance(packet_stats, pcap.PacketStatistics)
+    assert isinstance(packet_stats, pyshark.PacketStatistics)
     data_dict = packet_stats.data_series_application_size()
     assert isinstance(data_dict, dict)
 
@@ -150,14 +161,14 @@ def test_process():
     if is_corrupt(filename):
         assert fix_corrupt(filename)
     starttime = time()
-    packet_stats = pcap.process_pcap(filename=filename)
+    packet_stats = pyshark.process_pcap(filename=filename)
     processing_time = time() - starttime
-    assert isinstance(packet_stats, pcap.PacketStatistics)
+    assert isinstance(packet_stats, pyshark.PacketStatistics)
 
 
 def test_unique_hosts():
     filename = f'{TEST_DIR}/capture_20211215T031635_3600.pcap'
-    packet_stats = pcap.process_pcap(filename=filename)
+    packet_stats = pyshark.process_pcap(filename=filename)
     unique_hosts = packet_stats.unique_host_pairs()
     temp = []
     for hostpair in unique_hosts:
@@ -169,8 +180,10 @@ def test_analyze_conversations():
     # filename = f'{TEST_DIR}/capture_20220303T021914_60_eth0.pcap'
     # filename = f'{TEST_DIR}/capture_20211215T031635_3600.pcap'
     filename = f'{TEST_DIR}/capture_20220119T000001_60.pcap'
-    packet_stats = pcap.process_pcap(filename=filename)
+    packet_stats = pyshark.process_pcap(filename=filename)
     analysis = packet_stats.analyze_conversations()
+    for name, detail in analysis.items():
+        _log.debug(f'Conversation {name}:\n{json.dumps(detail, indent=2)}')
     assert isinstance(analysis, dict) and len(analysis) > 0
     for hostpair, summary in analysis.items():
         assert isinstance(summary, dict)
@@ -185,7 +198,7 @@ def test_analyze_conversations():
 
 def test_data_series_application_size():
     filename = f'{TEST_DIR}/valmont/valmont-mar17-2022.pcap'
-    packet_stats = pcap.process_pcap(filename=filename)
+    packet_stats = pyshark.process_pcap(filename=filename)
     data_series = packet_stats.data_series_application_size()
     for app, data in data_series.items():
         assert isinstance(app, str)
